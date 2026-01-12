@@ -1,3 +1,9 @@
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
 [project]
 name = "mlx-video"
 dynamic = ["version"]
@@ -33,16 +39,16 @@ Homepage = "https://github.com/Blaizzy/mlx-video"
 Repository = "https://github.com/Blaizzy/mlx-video"
 Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
-[project.optional-dependencies]
-dev = [
-    "pytest",
-]
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]
 
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+[tool.setuptools.dynamic]
+version = {attr = "mlx_video.version.__version__"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
