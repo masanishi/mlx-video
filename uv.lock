@@ -219,7 +219,6 @@ wheels = [
 
 [[package]]
 name = "mlx-video"
-version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
