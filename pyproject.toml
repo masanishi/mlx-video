@@ -1,6 +1,6 @@
 [project]
 name = "mlx-video"
-version = "0.0.1"
+dynamic = ["version"]
 description = "MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,18 +9,40 @@ dependencies = [
     "numpy",
     "safetensors",
     "huggingface_hub",
+    "transformers[tokenizers]",
     "tqdm",
+    "opencv-python>=4.12.0.88",
+    "Pillow>=10.3.0"
 ]
 license = {text="MIT"}
 authors = [
     {name = "Prince Canuma", email = "prince.gdt@gmail.com"}
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/Blaizzy/mlx-video"
+Repository = "https://github.com/Blaizzy/mlx-video"
+Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
 [project.optional-dependencies]
 dev = [
     "pytest",
 ]
+[project.scripts]
+"mlx_video.generate" = "mlx_video.generate:main"
+
+[tool.setuptools.packages.find]
+include = ["mlx_video*"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

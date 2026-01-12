@@ -1,1 +1,120 @@
 # mlx-video
+
+MLX-Video is the best package for inference and finetuning of Image-Video-Audio generation models on your Mac using MLX.
+
+## Installation
+
+Install from source:
+
+### Option 1: Install with pip (requires git):
+```bash
+pip install git+https://github.com/Blaizzy/mlx-video.git
+```
+
+### Option 2: Install with uv (ultra-fast package manager, optional):
+```bash
+uv pip install git+https://github.com/Blaizzy/mlx-video.git
+```
+
+### Optional Dependencies
+
+For video encoding/decoding:
+
+```bash
+pip install imageio[ffmpeg] pillow
+```
+
+
+Supported models:
+
+### LTX-2
+[LTX-2](https://huggingface.co/Lightricks/LTX-Video) is 19B parameter video generation model from Lightricks
+
+## Features
+
+- Text-to-video generation with the LTX-2 19B DiT model
+- Two-stage generation pipeline for high-quality output
+- 2x spatial upscaling for images and videos
+- Optimized for Apple Silicon using MLX
+
+
+## Usage
+
+> **ℹ️ Info:** Currently, only the distilled variant is supported. Full LTX-2 feature support is coming soon.
+
+### Text-to-Video Generation
+
+```bash
+uv run mlx_video.generate --prompt "A cat walking on grass"
+```
+
+With custom settings:
+
+```bash
+python -m mlx_video.generate \
+    --prompt "Ocean waves crashing on a beach at sunset" \
+    --height 768 \
+    --width 768 \
+    --num-frames 65 \
+    --seed 123 \
+    --output my_video.mp4
+```
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prompt`, `-p` | (required) | Text description of the video |
+| `--height`, `-H` | 512 | Output height (must be divisible by 64) |
+| `--width`, `-W` | 512 | Output width (must be divisible by 64) |
+| `--num-frames`, `-n` | 33 | Number of frames (must be 1 + 8*k) |
+| `--seed`, `-s` | 42 | Random seed for reproducibility |
+| `--fps` | 24 | Frames per second |
+| `--output`, `-o` | output.mp4 | Output video path |
+| `--save-frames` | false | Save individual frames as images |
+| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+
+## How It Works
+
+The pipeline uses a two-stage generation process:
+
+1. **Stage 1**: Generate at half resolution (e.g., 384x384) with 8 denoising steps
+2. **Upsample**: 2x spatial upsampling via LatentUpsampler
+3. **Stage 2**: Refine at full resolution (e.g., 768x768) with 3 denoising steps
+4. **Decode**: VAE decoder converts latents to RGB video
+
+## Requirements
+
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- Python >= 3.11
+- MLX >= 0.22.0
+
+## Model Specifications
+
+- **Transformer**: 48 layers, 32 attention heads, 128 dim per head
+- **Latent channels**: 128
+- **Text encoder**: Gemma 3 with 3840-dim output
+- **RoPE**: Split mode with double precision
+
+## Project Structure
+
+```
+mlx_video/
+├── generate.py             # Video generation pipeline
+├── convert.py              # Weight conversion (PyTorch -> MLX)
+├── postprocess.py          # Video post-processing utilities
+├── utils.py                # Helper functions
+└── models/
+    └── ltx/
+        ├── ltx.py          # Main LTXModel (DiT transformer)
+        ├── config.py       # Model configuration
+        ├── transformer.py  # Transformer blocks
+        ├── attention.py    # Multi-head attention with RoPE
+        ├── text_encoder.py # Text encoder
+        ├── upsampler.py    # 2x spatial upsampler
+        └── video_vae/      # VAE encoder/decoder
+```
+
+## License
+
+MIT
