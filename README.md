@@ -76,7 +76,7 @@ The pipeline uses a two-stage generation process:
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
+- macOS with Apple Silicon
 - Python >= 3.11
 - MLX >= 0.22.0
 
