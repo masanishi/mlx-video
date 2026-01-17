@@ -918,7 +918,7 @@ class LTX2TextEncoder(nn.Module):
             if response.token == 1 or response.token == 107:  # EOS tokens
                 break
 
-
+        mx.clear_cache()
 
         # Decode only the new tokens
 
