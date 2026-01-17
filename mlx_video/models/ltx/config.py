@@ -111,6 +111,7 @@ class LTXModelConfig(BaseModelConfig):
     audio_in_channels: int = 128
     audio_out_channels: int = 128
     audio_cross_attention_dim: int = 2048
+    audio_caption_channels: int = 3840  # Input dim for audio text embeddings (same as video)
 
     # Positional embedding config
     positional_embedding_theta: float = 10000.0
@@ -122,7 +123,7 @@ class LTXModelConfig(BaseModelConfig):
 
     # Timestep config
     timestep_scale_multiplier: int = 1000
-    av_ca_timestep_scale_multiplier: int = 1
+    av_ca_timestep_scale_multiplier: int = 1000
 
     # Normalization
     norm_eps: float = 1e-6
