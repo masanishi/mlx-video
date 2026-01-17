@@ -506,12 +506,7 @@ class LTX2VideoDecoder(nn.Module):
 
         if not needs_spatial_tiling and not needs_temporal_tiling:
             # No tiling needed, use regular decode
-            if debug:
-                print("[Tiling] Input fits within tile size, using regular decode")
             return self(sample, causal=causal, timestep=timestep, debug=debug, chunked_conv=use_chunked_conv)
-
-        if debug:
-            print(f"[Tiling] Using tiled decode (spatial={needs_spatial_tiling}, temporal={needs_temporal_tiling})")
 
         return decode_with_tiling(
             decoder_fn=self,
@@ -521,7 +516,6 @@ class LTX2VideoDecoder(nn.Module):
             temporal_scale=8,  # VAE temporal upsampling factor
             causal=causal,
             timestep=timestep,
-            debug=debug,
             chunked_conv=use_chunked_conv,
             on_frames_ready=on_frames_ready,
         )

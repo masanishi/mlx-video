@@ -488,12 +488,13 @@ def generate_video(
 
     # Stream mode: write frames as they're decoded
     video_writer = None
-    frames_written = [0]  # Use list to allow mutation in closure
+    stream_pbar = None
 
     if stream and tiling_config is not None:
         import cv2
         fourcc = cv2.VideoWriter_fourcc(*'avc1')
         video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        stream_pbar = tqdm(total=num_frames, desc="Streaming", unit="frame")
 
         def on_frames_ready(frames: mx.array, start_idx: int):
             """Callback to write frames as they're finalized."""
@@ -506,11 +507,7 @@ def generate_video(
 
             for frame in frames_np:
                 video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                frames_written[0] += 1
-
-            print(f"{Colors.DIM}  Progressive: wrote frames {start_idx}-{start_idx + len(frames_np) - 1} ({frames_written[0]} total){Colors.RESET}")
-
-        print(f"{Colors.MAGENTA}📹 Streaming enabled - frames will be written as decoded{Colors.RESET}")
+                stream_pbar.update(1)
     else:
         on_frames_ready = None
 
@@ -528,6 +525,8 @@ def generate_video(
     # Close progressive video writer if used
     if video_writer is not None:
         video_writer.release()
+        if stream_pbar is not None:
+            stream_pbar.close()
         print(f"{Colors.GREEN}✅ Streamed video to{Colors.RESET} {output_path}")
         # Still need video_np for save_frames option
         video = mx.squeeze(video, axis=0)
