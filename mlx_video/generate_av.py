@@ -3,7 +3,7 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import mlx.core as mx
 import numpy as np
@@ -30,6 +30,7 @@ from mlx_video.convert import sanitize_transformer_weights, sanitize_audio_vae_w
 from mlx_video.utils import to_denoised, get_model_path, load_image, prepare_image_for_encoding
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder
 from mlx_video.models.ltx.video_vae.encoder import load_vae_encoder
+from mlx_video.models.ltx.video_vae.tiling import TilingConfig
 from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents
 from mlx_video.conditioning import VideoConditionByLatentIndex, apply_conditioning
 from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
@@ -163,6 +164,7 @@ def denoise_av(
     Returns:
         Tuple of (video_latents, audio_latents)
     """
+    dtype = video_latents.dtype
     # If video state is provided, use its latent
     if video_state is not None:
         video_latents = video_state.latent
@@ -188,10 +190,10 @@ def denoise_av(
             denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
             denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_video_tokens))
             # Per-token timesteps: sigma * mask
-            video_timesteps = sigma * denoise_mask_flat
+            video_timesteps = mx.array(sigma, dtype=dtype) * denoise_mask_flat
         else:
             # All tokens get the same timestep
-            video_timesteps = mx.full((b, num_video_tokens), sigma)
+            video_timesteps = mx.full((b, num_video_tokens), sigma, dtype=dtype)
 
         video_modality = Modality(
             latent=video_flat,
@@ -204,7 +206,7 @@ def denoise_av(
 
         audio_modality = Modality(
             latent=audio_flat,
-            timesteps=mx.full((ab, at), sigma),
+            timesteps=mx.full((ab, at), sigma, dtype=dtype),
             positions=audio_positions,
             context=audio_embeddings,
             context_mask=None,
@@ -229,10 +231,12 @@ def denoise_av(
 
         mx.eval(video_denoised, audio_denoised)
 
-        # Euler step
+        # Euler step - use dtype-preserving arrays to avoid float32 promotion
         if sigma_next > 0:
-            video_latents = video_denoised + sigma_next * (video_latents - video_denoised) / sigma
-            audio_latents = audio_denoised + sigma_next * (audio_latents - audio_denoised) / sigma
+            sigma_next_arr = mx.array(sigma_next, dtype=dtype)
+            sigma_arr = mx.array(sigma, dtype=dtype)
+            video_latents = video_denoised + sigma_next_arr * (video_latents - video_denoised) / sigma_arr
+            audio_latents = audio_denoised + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
         else:
             video_latents = video_denoised
             audio_latents = audio_denoised
@@ -363,6 +367,7 @@ def generate_video_with_audio(
     image: Optional[str] = None,
     image_strength: float = 1.0,
     image_frame_idx: int = 0,
+    tiling: str = "auto",
 ):
     """Generate video with synchronized audio from text prompt, optionally conditioned on an image.
 
@@ -384,6 +389,7 @@ def generate_video_with_audio(
         image: Path to conditioning image for I2V
         image_strength: Conditioning strength (1.0 = full denoise)
         image_frame_idx: Frame index to condition (0 = first frame)
+        tiling: Tiling mode for VAE decoding (auto/none/default/aggressive/conservative/spatial/temporal)
     """
     start_time = time.time()
 
@@ -432,6 +438,7 @@ def generate_video_with_audio(
 
     # Get both video and audio embeddings
     video_embeddings, audio_embeddings = text_encoder(prompt)
+    model_dtype = video_embeddings.dtype  # bfloat16 from text encoder
     mx.eval(video_embeddings, audio_embeddings)
 
     del text_encoder
@@ -441,6 +448,9 @@ def generate_video_with_audio(
     print(f"{Colors.BLUE}🤖 Loading transformer (A/V mode)...{Colors.RESET}")
     raw_weights = mx.load(str(model_path / 'ltx-2-19b-distilled.safetensors'))
     sanitized = sanitize_transformer_weights(raw_weights)
+
+    # Convert transformer weights to bfloat16 for memory efficiency
+    sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
 
     config = LTXModelConfig(
         model_type=LTXModelType.AudioVideo,
@@ -479,18 +489,16 @@ def generate_video_with_audio(
         mx.eval(vae_encoder.parameters())
 
         # Load and prepare image for stage 1 (half resolution)
-        input_image = load_image(image, height=height // 2, width=width // 2)
-        stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2)
+        input_image = load_image(image, height=height // 2, width=width // 2, dtype=model_dtype)
+        stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
         stage1_image_latent = vae_encoder(stage1_image_tensor)
         mx.eval(stage1_image_latent)
-        print(f"  Stage 1 image latent: {stage1_image_latent.shape}")
 
         # Load and prepare image for stage 2 (full resolution)
-        input_image = load_image(image, height=height, width=width)
-        stage2_image_tensor = prepare_image_for_encoding(input_image, height, width)
+        input_image = load_image(image, height=height, width=width, dtype=model_dtype)
+        stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
         stage2_image_latent = vae_encoder(stage2_image_tensor)
         mx.eval(stage2_image_latent)
-        print(f"  Stage 2 image latent: {stage2_image_latent.shape}")
 
         del vae_encoder
         mx.clear_cache()
@@ -499,9 +507,10 @@ def generate_video_with_audio(
     print(f"{Colors.YELLOW}⚡ Stage 1: Generating at {width//2}x{height//2} (8 steps)...{Colors.RESET}")
     mx.random.seed(seed)
 
-    # Create position grids
-    video_positions = create_video_position_grid(1, latent_frames, stage1_h, stage1_w)
-    audio_positions = create_audio_position_grid(1, audio_frames)
+    # Create position grids - MUST stay float32 for RoPE precision
+    # bfloat16 positions cause quality degradation due to precision loss in sin/cos calculations
+    video_positions = create_video_position_grid(1, latent_frames, stage1_h, stage1_w)  # float32
+    audio_positions = create_audio_position_grid(1, audio_frames)  # float32
     mx.eval(video_positions, audio_positions)
 
     # Apply I2V conditioning for stage 1 if provided
@@ -510,9 +519,9 @@ def generate_video_with_audio(
     if is_i2v and stage1_image_latent is not None:
         # PyTorch flow: create zeros -> apply conditioning -> apply noiser
         video_state1 = LatentState(
-            latent=mx.zeros(video_latent_shape),
-            clean_latent=mx.zeros(video_latent_shape),
-            denoise_mask=mx.ones((1, 1, latent_frames, 1, 1)),
+            latent=mx.zeros(video_latent_shape, dtype=model_dtype),
+            clean_latent=mx.zeros(video_latent_shape, dtype=model_dtype),
+            denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
         conditioning = VideoConditionByLatentIndex(
             latent=stage1_image_latent,
@@ -522,11 +531,11 @@ def generate_video_with_audio(
         video_state1 = apply_conditioning(video_state1, [conditioning])
 
         # Apply noiser: latent = noise * (mask * noise_scale) + latent * (1 - mask * noise_scale)
-        noise = mx.random.normal(video_latent_shape)
-        noise_scale = STAGE_1_SIGMAS[0]  # 1.0
+        noise = mx.random.normal(video_latent_shape).astype(model_dtype)
+        noise_scale = mx.array(STAGE_1_SIGMAS[0], dtype=model_dtype)  # 1.0
         scaled_mask = video_state1.denoise_mask * noise_scale
         video_state1 = LatentState(
-            latent=noise * scaled_mask + video_state1.latent * (1.0 - scaled_mask),
+            latent=noise * scaled_mask + video_state1.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
             clean_latent=video_state1.clean_latent,
             denoise_mask=video_state1.denoise_mask,
         )
@@ -534,11 +543,11 @@ def generate_video_with_audio(
         mx.eval(video_latents)
     else:
         # T2V: just use random noise
-        video_latents = mx.random.normal(video_latent_shape)
+        video_latents = mx.random.normal(video_latent_shape).astype(model_dtype)
         mx.eval(video_latents)
 
     # Audio always uses pure noise (no I2V for audio)
-    audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS))
+    audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
     mx.eval(audio_latents)
 
     # Stage 1 denoising
@@ -568,7 +577,8 @@ def generate_video_with_audio(
 
     # Stage 2: Refine at full resolution
     print(f"{Colors.YELLOW}⚡ Stage 2: Refining at {width}x{height} (3 steps)...{Colors.RESET}")
-    video_positions = create_video_position_grid(1, latent_frames, stage2_h, stage2_w)
+    # Position grids stay float32 for RoPE precision
+    video_positions = create_video_position_grid(1, latent_frames, stage2_h, stage2_w)  # float32
     mx.eval(video_positions)
 
     # Apply I2V conditioning for stage 2 if provided
@@ -578,7 +588,7 @@ def generate_video_with_audio(
         video_state2 = LatentState(
             latent=video_latents,  # Start with upscaled latent
             clean_latent=mx.zeros_like(video_latents),
-            denoise_mask=mx.ones((1, 1, latent_frames, 1, 1)),
+            denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
         )
         conditioning = VideoConditionByLatentIndex(
             latent=stage2_image_latent,
@@ -588,11 +598,11 @@ def generate_video_with_audio(
         video_state2 = apply_conditioning(video_state2, [conditioning])
 
         # Apply noiser: conditioned frames (mask=0) keep image latent, unconditioned get partial noise
-        video_noise = mx.random.normal(video_latents.shape)
-        noise_scale = STAGE_2_SIGMAS[0]
+        video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
+        noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
         scaled_mask = video_state2.denoise_mask * noise_scale
         video_state2 = LatentState(
-            latent=video_noise * scaled_mask + video_state2.latent * (1.0 - scaled_mask),
+            latent=video_noise * scaled_mask + video_state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
             clean_latent=video_state2.clean_latent,
             denoise_mask=video_state2.denoise_mask,
         )
@@ -600,16 +610,18 @@ def generate_video_with_audio(
         mx.eval(video_latents)
 
         # Audio still gets noise (no I2V for audio)
-        audio_noise = mx.random.normal(audio_latents.shape)
-        audio_latents = audio_noise * noise_scale + audio_latents * (1 - noise_scale)
+        audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
+        one_minus_scale = mx.array(1.0, dtype=model_dtype) - noise_scale
+        audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
         mx.eval(audio_latents)
     else:
         # T2V: add noise to all frames for refinement
-        noise_scale = STAGE_2_SIGMAS[0]
-        video_noise = mx.random.normal(video_latents.shape)
-        audio_noise = mx.random.normal(audio_latents.shape)
-        video_latents = video_noise * noise_scale + video_latents * (1 - noise_scale)
-        audio_latents = audio_noise * noise_scale + audio_latents * (1 - noise_scale)
+        noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
+        one_minus_scale = mx.array(1.0, dtype=model_dtype) - noise_scale
+        video_noise = mx.random.normal(video_latents.shape).astype(model_dtype)
+        audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
+        video_latents = video_noise * noise_scale + video_latents * one_minus_scale
+        audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
         mx.eval(video_latents, audio_latents)
 
     video_latents, audio_latents = denoise_av(
@@ -623,9 +635,36 @@ def generate_video_with_audio(
     del transformer
     mx.clear_cache()
 
-    # Decode video
+    # Decode video with tiling
     print(f"{Colors.BLUE}🎞️  Decoding video...{Colors.RESET}")
-    video = vae_decoder(video_latents)
+
+    # Select tiling configuration
+    if tiling == "none":
+        tiling_config = None
+    elif tiling == "auto":
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+    elif tiling == "default":
+        tiling_config = TilingConfig.default()
+    elif tiling == "aggressive":
+        tiling_config = TilingConfig.aggressive()
+    elif tiling == "conservative":
+        tiling_config = TilingConfig.conservative()
+    elif tiling == "spatial":
+        tiling_config = TilingConfig.spatial_only()
+    elif tiling == "temporal":
+        tiling_config = TilingConfig.temporal_only()
+    else:
+        print(f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}")
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+
+    if tiling_config is not None:
+        spatial_info = f"{tiling_config.spatial_config.tile_size_in_pixels}px" if tiling_config.spatial_config else "none"
+        temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
+        print(f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}")
+        video = vae_decoder.decode_tiled(video_latents, tiling_config=tiling_config, debug=verbose)
+    else:
+        print(f"{Colors.DIM}  Tiling: disabled{Colors.RESET}")
+        video = vae_decoder(video_latents)
     mx.eval(video)
 
     # Convert video to uint8 frames
@@ -641,26 +680,12 @@ def generate_video_with_audio(
     vocoder = load_vocoder(model_path)
     mx.eval(audio_decoder.parameters(), vocoder.parameters())
 
-    # Debug: check per-channel statistics are loaded
-    pcs = audio_decoder.per_channel_statistics
-    print(f"Per-channel stats: mean_of_means range=[{pcs._mean_of_means.min():.4f}, {pcs._mean_of_means.max():.4f}], std_of_means range=[{pcs._std_of_means.min():.4f}, {pcs._std_of_means.max():.4f}]")
-
-    # Debug: check audio latent statistics
-    print(f"Audio latents shape: {audio_latents.shape}")
-    print(f"Audio latents stats: min={audio_latents.min():.4f}, max={audio_latents.max():.4f}, mean={audio_latents.mean():.4f}, std={mx.std(audio_latents):.4f}")
-
     mel_spectrogram = audio_decoder(audio_latents)
     mx.eval(mel_spectrogram)
-
-    print(f"Mel spectrogram shape: {mel_spectrogram.shape}")
-    print(f"Mel spectrogram stats: min={mel_spectrogram.min():.4f}, max={mel_spectrogram.max():.4f}, mean={mel_spectrogram.mean():.4f}")
 
     # Audio decoder output is already in vocoder format (B, C, T, F)
     audio_waveform = vocoder(mel_spectrogram)
     mx.eval(audio_waveform)
-
-    print(f"Audio waveform shape: {audio_waveform.shape}")
-    print(f"Audio waveform stats: min={audio_waveform.min():.4f}, max={audio_waveform.max():.4f}, mean={audio_waveform.mean():.4f}")
 
     audio_np = np.array(audio_waveform)
     if audio_np.ndim == 3:
@@ -762,6 +787,11 @@ Examples:
                         help="Conditioning strength for I2V (1.0 = full denoise, 0.0 = keep original, default: 1.0)")
     parser.add_argument("--image-frame-idx", type=int, default=0,
                         help="Frame index to condition for I2V (0 = first frame, default: 0)")
+    parser.add_argument("--tiling", type=str, default="auto",
+                        choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
+                        help="Tiling mode for VAE decoding (default: auto). "
+                             "auto=based on size, none=disabled, default=512px/64f, "
+                             "aggressive=256px/32f (lowest memory), conservative=768px/96f")
 
     args = parser.parse_args()
 
@@ -783,6 +813,7 @@ Examples:
         image=args.image,
         image_strength=args.image_strength,
         image_frame_idx=args.image_frame_idx,
+        tiling=args.tiling,
     )
 
 
