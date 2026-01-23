@@ -277,12 +277,12 @@ class VideoDecoderModelConfig(BaseModelConfig):
 @dataclass
 class VideoEncoderModelConfig(BaseModelConfig):
     convolution_dimensions: int = 3
-    in_channels : int = 3,
-    out_channels: int = 128,
-    patch_size: int = 4,
-    norm_layer: Enum = None,
-    latent_log_var: Enum = None,
-    encoder_spatial_padding_mode: Enum = None,
+    in_channels: int = 3
+    out_channels: int = 128
+    patch_size: int = 4
+    norm_layer: Enum = None
+    latent_log_var: Enum = None
+    encoder_spatial_padding_mode: Enum = None
     encoder_blocks: List[tuple] = field(default_factory=lambda: [("res_x", {"num_layers": 4}),
         ("compress_space_res", {"multiplier": 2}),
         ("res_x", {"num_layers": 6}),
