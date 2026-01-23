@@ -273,6 +273,7 @@ class VideoDecoderModelConfig(BaseModelConfig):
     norm_type: Enum = None
     causality_axis: Enum = None
     dropout: float = 0.0
+    timestep_conditioning: bool = False
 
 @dataclass
 class VideoEncoderModelConfig(BaseModelConfig):
