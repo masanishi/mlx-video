@@ -560,3 +560,7 @@ class LTX2VideoDecoder(nn.Module):
             chunked_conv=use_chunked_conv,
             on_frames_ready=on_frames_ready,
         )
+
+
+# Backward-compatible alias
+VideoDecoder = LTX2VideoDecoder
