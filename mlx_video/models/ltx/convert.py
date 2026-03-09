@@ -611,6 +611,33 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
         else:
             print(f"  {upscaler_file}: not found, skipping")
 
+    # 8. Link text_encoder and tokenizer directories
+    print("\nLinking text encoder & tokenizer...")
+    for subdir in ["text_encoder", "tokenizer"]:
+        dest = output_path / subdir
+        if dest.exists():
+            print(f"  {subdir}/: already exists, skipping")
+            continue
+
+        local_candidate = source_dir / subdir
+        if local_candidate.is_dir():
+            # Resolve through symlinks to get the real directory
+            real_path = local_candidate.resolve()
+            dest.symlink_to(real_path)
+            print(f"  {subdir}/: symlinked to {real_path}")
+        elif is_hf_repo:
+            from huggingface_hub import snapshot_download
+
+            print(f"  {subdir}/: downloading from {source}...")
+            snapshot_download(
+                repo_id=source,
+                allow_patterns=f"{subdir}/*",
+                local_dir=str(output_path),
+            )
+            print(f"  {subdir}/: done")
+        else:
+            print(f"  {subdir}/: not found in source, skipping")
+
     # Summary
     all_converted = (
         len(transformer_weights)

@@ -754,7 +754,10 @@ class LTX2TextEncoder(nn.Module):
         if tokenizer_path.exists():
             self.processor = AutoTokenizer.from_pretrained(str(tokenizer_path), trust_remote_code=True)
         else:
-            self.processor = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
+            try:
+                self.processor = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
+            except Exception:
+                self.processor = AutoTokenizer.from_pretrained("google/gemma-3-12b-it", trust_remote_code=True)
         # Set left padding to match official LTX-2 text encoder
         self.processor.padding_side = "left"
 
