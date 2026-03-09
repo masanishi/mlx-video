@@ -45,7 +45,8 @@ class WanModelConfig(BaseModelConfig):
         "杂乱的背景，三条腿，背景人很多，倒着走"
     )
 
-    # T5
+    # Resolution constraints
+    max_area: int = 0  # 0 = no limit; e.g. 704*1280 for TI2V-5B
     t5_vocab_size: int = 256384
     t5_dim: int = 4096
     t5_dim_attn: int = 4096
@@ -102,7 +103,8 @@ class WanModelConfig(BaseModelConfig):
             boundary=0.900,
             sample_shift=5.0,
             sample_guide_scale=(3.5, 3.5),
-        )
+            max_area=704 * 1280,
+
 
     @classmethod
     def wan22_ti2v_5b(cls) -> "WanModelConfig":
@@ -120,7 +122,8 @@ class WanModelConfig(BaseModelConfig):
             dual_model=False,
             boundary=0.0,
             sample_shift=5.0,
-            sample_steps=50,
+            sample_steps=40,
             sample_guide_scale=5.0,
             sample_fps=24,
-        )
+            max_area=704 * 1280,
+
