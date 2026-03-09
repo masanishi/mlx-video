@@ -12,6 +12,8 @@ from PIL import Image
 def get_model_path(model_repo: str):
     """Get or download LTX-2 model path."""
     try:
+        if Path(model_repo).exists():
+            return Path(model_repo)
         return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
     except Exception:
         print("Downloading LTX-2 model weights...")
