@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Tuple, Union
 
 from mlx_video.models.ltx.config import BaseModelConfig
 
@@ -104,7 +104,7 @@ class WanModelConfig(BaseModelConfig):
             sample_shift=5.0,
             sample_guide_scale=(3.5, 3.5),
             max_area=704 * 1280,
-
+        )
 
     @classmethod
     def wan22_ti2v_5b(cls) -> "WanModelConfig":
@@ -126,4 +126,4 @@ class WanModelConfig(BaseModelConfig):
             sample_guide_scale=5.0,
             sample_fps=24,
             max_area=704 * 1280,
-
+        )

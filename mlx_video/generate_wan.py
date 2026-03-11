@@ -75,7 +75,6 @@ def generate_video(
     trim_first_frames: int = 0,
     debug_latents: bool = False,
 ):
-
     """Generate video using Wan pipeline (supports T2V and I2V).
 
     Args:
@@ -108,7 +107,6 @@ def generate_video(
             discards first 4). Use 2 for more aggressive trimming. Default: 0.
         debug_latents: If True, print per-temporal-position latent statistics
             after denoising for diagnosing first-frame artifacts.
-
     """
     import json
 
@@ -494,15 +492,13 @@ def generate_video(
     print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
     t3 = time.time()
 
+    # Compile model forward for faster denoising
     if not no_compile:
         models_to_compile = (
             [high_noise_model, low_noise_model] if is_dual else [single_model]
         )
         for m in models_to_compile:
             m._compiled = mx.compile(m)
-
-
-
 
     # Pre-convert timesteps to Python list to avoid .item() sync each step
     timestep_list = sched.timesteps.tolist()
@@ -773,7 +769,6 @@ def main():
         "--debug-latents", action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
     )
-
     args = parser.parse_args()
 
     # Parse guide scale
@@ -814,7 +809,6 @@ def main():
         no_compile=args.no_compile,
         trim_first_frames=args.trim_first_frames,
         debug_latents=args.debug_latents,
-
     )
 
 

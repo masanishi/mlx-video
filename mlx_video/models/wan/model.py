@@ -1,5 +1,4 @@
 import math
-
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -353,7 +352,6 @@ class WanModel(nn.Module):
             attn_mask = mx.zeros((batch_size, 1, 1, seq_len), dtype=w_dtype)
             for i, sl in enumerate(seq_lens_list):
                 attn_mask[i, :, :, sl:] = -1e9
-
 
         kwargs = dict(
             e=e0,

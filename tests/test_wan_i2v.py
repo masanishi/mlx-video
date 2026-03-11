@@ -19,7 +19,6 @@ def _make_tiny_i2v_config():
     config.boundary = 0.900
     config.sample_shift = 5.0
     config.sample_guide_scale = (3.5, 3.5)
-    config.teacache_coefficients = None
     return config
 
 
@@ -41,7 +40,6 @@ class TestI2VConfig:
         assert config.sample_guide_scale == (3.5, 3.5)
         assert config.vae_stride == (4, 8, 8)
         assert config.vae_z_dim == 16
-        assert config.teacache_coefficients is None
 
     def test_i2v_vs_t2v_differences(self):
         from mlx_video.models.wan.config import WanModelConfig

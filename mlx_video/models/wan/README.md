@@ -146,12 +146,16 @@ For example, for using the the distilled [Wan2.2-Lightning](https://huggingface.
 python -m mlx_video.generate_wan \
     --model-dir /Volumes/SSD/Wan-AI/Wan2.2-T2V-A14B-MLX \
     --width 480 \
-    --height 480 \
-    --num-frames 121 \
-    --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, close up, cinematic, sunset" \
+    --height 704 \
+    --num-frames 41 \
+    --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, nodding with their heads, close up, cinematic, sunset" \
     --steps 4 \
     --guide-scale 1 \
     --trim-first-frames 1 \
+    --seed 2391784614 \
     --lora-high /Volumes/SSD/Wan-AI/lightx2v/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors 1 \
     --lora-low /Volumes/SSD/Wan-AI/lightx2v/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors 1
  ```
+
+Which results in 
+![Poodles](../../../examples/poodles-wan.gif)

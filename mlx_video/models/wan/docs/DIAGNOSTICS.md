@@ -315,11 +315,6 @@ Applied alongside bug fixes to improve inference speed:
 - **Redundant type cast removal**: MLX type promotion handles `bfloat16 * float32 → float32` automatically — removed 240 unnecessary graph nodes per step (6 casts × 40 blocks)
 - **Euler scheduler sync fix**: Pre-store sigmas as Python floats to avoid `.item()` evaluation sync
 
-### TeaCache Integration
-- Polynomial rescaling stays in MLX lazy graph (Horner's method)
-- Single `.item()` call on the accumulated distance for the skip/compute decision
-- Configurable threshold, retention steps, and cutoff steps
-
 ---
 
 ## Resolved: CFG Effectiveness (was Open Investigation)

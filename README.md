@@ -150,7 +150,29 @@ The I2V-14B model encodes the input image through the Wan2.1 VAE encoder and use
 | `--seed` | -1 (random) | Random seed for reproducibility |
 | `--output-path` | `output.mp4` | Output video path |
 
+## LoRA Support
 
+LoRA's can be used with the `--lora-high` and `--lora-low` command line switches.
+
+For example, for using the the distilled [Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) LoRA, use the following command. Lightning speeds up generation by using only 4 steps and a CFG scale of 1.
+
+```bash
+python -m mlx_video.generate_wan \
+    --model-dir /Volumes/SSD/Wan-AI/Wan2.2-T2V-A14B-MLX \
+    --width 480 \
+    --height 704 \
+    --num-frames 41 \
+    --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, nodding with their heads, close up, cinematic, sunset" \
+    --steps 4 \
+    --guide-scale 1 \
+    --trim-first-frames 1 \
+    --seed 2391784614 \
+    --lora-high /Volumes/SSD/Wan-AI/lightx2v/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors 1 \
+    --lora-low /Volumes/SSD/Wan-AI/lightx2v/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors 1
+ ```
+
+Which results in 
+![Poodles](examples/poodles-wan.gif)
 
 ## Requirements
 
