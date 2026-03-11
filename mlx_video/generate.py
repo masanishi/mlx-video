@@ -9,9 +9,8 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+# ANSI color codes
 class Colors:
-    """ANSI color codes for terminal output."""
-
     CYAN = "\033[96m"
     BLUE = "\033[94m"
     GREEN = "\033[92m"
