@@ -80,14 +80,25 @@ def load_and_merge_lora(
         lora_path: Path to the LoRA safetensors file or directory containing one
         strength: LoRA strength/coefficient (default 1.0)
     """
-    # Resolve path: if directory, find the safetensors file inside
+    # Resolve path: local file/dir or HuggingFace repo
     lora_file = Path(lora_path)
-    if lora_file.is_dir():
+    if lora_file.is_file():
+        pass  # direct file path
+    elif lora_file.is_dir():
+        # Local directory: find safetensors inside
         candidates = sorted(lora_file.glob("*.safetensors"))
         if not candidates:
             raise FileNotFoundError(f"No .safetensors files found in {lora_path}")
         lora_file = candidates[0]
         console.print(f"[dim]Using LoRA file: {lora_file.name}[/]")
+    else:
+        # Treat as HuggingFace repo ID
+        lora_dir = get_model_path(lora_path)
+        candidates = sorted(lora_dir.glob("*.safetensors"))
+        if not candidates:
+            raise FileNotFoundError(f"No .safetensors files found in {lora_dir}")
+        lora_file = candidates[0]
+        console.print(f"[dim]Using LoRA from repo: {lora_path} ({lora_file.name})[/]")
 
     # Load LoRA weights
     lora_weights = mx.load(str(lora_file))
