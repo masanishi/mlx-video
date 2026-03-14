@@ -120,8 +120,8 @@ class Vocoder(nn.Module):
         model = cls(config)
         weights = mx.load(str(model_path / "model.safetensors"))
 
-        # weights = vocoder.sanitize(weights)
-        model.load_weights(list(weights.items()), strict=strict)
+        # Use strict=False to skip extra keys (e.g., bwe_generator in LTX-2.3)
+        model.load_weights(list(weights.items()), strict=False)
         return model
 
 
