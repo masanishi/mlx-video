@@ -725,17 +725,17 @@ class LTX2TextEncoder(nn.Module):
             )
 
             # Deeper connectors with matching dims and gate_logits
-            # NOTE: positional_embedding_max_pos=[1] matches PyTorch default
-            # (connector_positional_embedding_max_pos not in LTX-2.3 config)
+            # connector_positional_embedding_max_pos=[4096] from LTX-2.3 safetensors
+            # config (nested under config.transformer.connector_positional_embedding_max_pos)
             self.video_embeddings_connector = Embeddings1DConnector(
                 dim=video_output_dim, num_heads=32, head_dim=128,
                 num_layers=8, num_learnable_registers=128,
-                positional_embedding_max_pos=[1], has_gate_logits=True,
+                positional_embedding_max_pos=[4096], has_gate_logits=True,
             )
             self.audio_embeddings_connector = Embeddings1DConnector(
                 dim=audio_output_dim, num_heads=32, head_dim=64,
                 num_layers=8, num_learnable_registers=128,
-                positional_embedding_max_pos=[1], has_gate_logits=True,
+                positional_embedding_max_pos=[4096], has_gate_logits=True,
             )
         else:
             # LTX-2: shared feature extractor, 3840-dim connectors
