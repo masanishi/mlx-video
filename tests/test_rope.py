@@ -87,7 +87,7 @@ def _numpy_reference_rope(positions_np, dim, theta, max_pos, num_heads):
         cos_ref = np.concatenate([np.ones((*cos_ref.shape[:-1], pad_size)), cos_ref], axis=-1)
         sin_ref = np.concatenate([np.zeros((*sin_ref.shape[:-1], pad_size)), sin_ref], axis=-1)
 
-    B, T, F = cos_ref.shape
+    B, T, _ = cos_ref.shape
     dim_per_head = dim // num_heads
     cos_ref = cos_ref.reshape(B, T, num_heads, dim_per_head // 2).transpose(0, 2, 1, 3)
     sin_ref = sin_ref.reshape(B, T, num_heads, dim_per_head // 2).transpose(0, 2, 1, 3)
