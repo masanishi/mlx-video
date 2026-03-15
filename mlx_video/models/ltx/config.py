@@ -260,9 +260,13 @@ class VocoderModelConfig(BaseModelConfig):
     stereo: bool = True
     resblock: str = "1"
     output_sample_rate: int = 24000
+    activation: str = "snake"
+    use_tanh_at_final: bool = True
+    apply_final_activation: bool = True
+    use_bias_at_final: bool = True
 
     def __post_init__(self):
-                
+
         if self.resblock_kernel_sizes is None:
             self.resblock_kernel_sizes = [3, 7, 11]
         if self.upsample_rates is None:

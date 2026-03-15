@@ -9,12 +9,13 @@ from .normalization import NormType, PixelNorm, build_normalization_layer
 from .ops import AudioLatentShape, AudioPatchifier, PerChannelStatistics
 from .resnet import LRELU_SLOPE, ResBlock1, ResBlock2, ResnetBlock
 from .upsample import Upsample, build_upsampling_path
-from .vocoder import Vocoder
+from .vocoder import Vocoder, load_vocoder
 
 __all__ = [
     # Main components
     "AudioDecoder",
     "Vocoder",
+    "load_vocoder",
     "decode_audio",
     # Ops
     "AudioLatentShape",
