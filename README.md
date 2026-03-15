@@ -24,7 +24,7 @@ Supported models:
 ## Features
 
 - Text-to-video (T2V) and Image-to-video (I2V) generation
-- Three pipeline modes: Distilled, Dev, and Dev Two-Stage
+- Four pipeline modes: Distilled, Dev, Dev Two-Stage, and Dev Two-Stage HQ
 - Synchronized audio-video generation (experimental)
 - LoRA support (including HuggingFace repos)
 - Prompt enhancement via Gemma
@@ -35,13 +35,14 @@ Supported models:
 
 ### Pipelines
 
-mlx-video supports three pipeline types via the `--pipeline` flag:
+mlx-video supports four pipeline types via the `--pipeline` flag:
 
 | Pipeline | Description | CFG | Stages | Speed |
 |----------|-------------|-----|--------|-------|
 | `distilled` (default) | Fixed sigma schedule, no CFG | No | 2 (8+3 steps) | Fastest |
 | `dev` | Dynamic sigmas, constant CFG | Yes | 1 (30 steps) | Medium |
-| `dev-two-stage` | Dev + LoRA refinement | Yes (stage 1) | 2 (30+3 steps) | Slowest, highest quality |
+| `dev-two-stage` | Dev + LoRA refinement | Yes (stage 1) | 2 (30+3 steps) | Slow |
+| `dev-two-stage-hq` | res_2s sampler + LoRA both stages | Yes (stage 1) | 2 (15+3 steps) | Slow, highest quality |
 
 ### Text-to-Video
 
@@ -52,13 +53,24 @@ uv run mlx_video.generate --prompt "Two dogs wearing sunglasses, cinematic, suns
 # Dev - single-stage with CFG
 uv run mlx_video.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
 
-# Dev two-stage - dev + LoRA refinement (highest quality)
+# Dev two-stage - dev + LoRA refinement
 uv run mlx_video.generate --pipeline dev-two-stage \
     --prompt "Two dogs of the poodle breed wearing sunglasses, close up, cinematic, sunset" \
     -n 145 --width 1024 --height 768 \
     --model-repo prince-canuma/LTX-2-dev \
     --cfg-scale 3.0 --lora-strength 0.8 \
     --enhance-prompt
+
+# Dev two-stage HQ - res_2s sampler, LoRA both stages (highest quality)
+uv run mlx_video.generate --pipeline dev-two-stage-hq \
+    --prompt "A cinematic scene of ocean waves at golden hour" \
+    --model-repo prince-canuma/LTX-2-dev
+
+# HQ with custom LoRA strengths
+uv run mlx_video.generate --pipeline dev-two-stage-hq \
+    --prompt "A sunset over mountains" \
+    --model-repo prince-canuma/LTX-2-dev \
+    --lora-strength-stage-1 0.3 --lora-strength-stage-2 0.6
 ```
 
 <img src="https://github.com/Blaizzy/mlx-video/raw/main/examples/poodles.gif" width="512" alt="Poodles demo">
@@ -124,7 +136,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--prompt`, `-p` | (required) | Text description of the video |
-| `--pipeline` | `distilled` | Pipeline type: `distilled`, `dev`, or `dev-two-stage` |
+| `--pipeline` | `distilled` | Pipeline type: `distilled`, `dev`, `dev-two-stage`, or `dev-two-stage-hq` |
 | `--height`, `-H` | 512 | Output height (divisible by 64 for two-stage, 32 for dev) |
 | `--width`, `-W` | 512 | Output width (divisible by 64 for two-stage, 32 for dev) |
 | `--num-frames`, `-n` | 33 | Number of frames (must be 1 + 8*k) |
@@ -161,6 +173,15 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--lora-path` | auto-detect | Path to LoRA file, directory, or HuggingFace repo |
 | `--lora-strength` | 1.0 | LoRA merge strength |
 
+**Dev-Two-Stage HQ options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--lora-strength-stage-1` | 0.25 | LoRA strength for stage 1 |
+| `--lora-strength-stage-2` | 0.5 | LoRA strength for stage 2 |
+
+HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses the res_2s second-order sampler (2 model evals per step) for better quality at the same compute budget.
+
 ## How It Works
 
 ### Distilled Pipeline (default)
@@ -178,6 +199,14 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 2. **Upsample**: 2x spatial upsampling via LatentUpsampler
 3. **Stage 2**: Distilled refinement at full resolution with LoRA weights (3 steps, no CFG)
 4. **Decode**: VAE decoder converts latents to RGB video
+
+### Dev Two-Stage HQ Pipeline
+1. **Stage 1**: res_2s denoising at half resolution with CFG + LoRA@0.25 (15 steps, 2 evals/step)
+2. **Upsample**: 2x spatial upsampling via LatentUpsampler
+3. **Stage 2**: res_2s refinement at full resolution with LoRA@0.5 (3 steps, no CFG)
+4. **Decode**: VAE decoder converts latents to RGB video
+
+The res_2s sampler uses an exponential Rosenbrock-type Runge-Kutta integrator with SDE noise injection, producing higher quality results than Euler at the same compute budget (~30 total model evaluations).
 
 ## Requirements
 
