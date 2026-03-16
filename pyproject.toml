@@ -21,6 +21,7 @@ dependencies = [
     "Pillow>=10.3.0",
     "mlx-vlm",
     "rich>=14.2.0",
+    "librosa>=0.10.0",
 ]
 license = {text="MIT"}
 authors = [
