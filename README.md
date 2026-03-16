@@ -24,6 +24,7 @@ Supported models:
 ## Features
 
 - Text-to-video (T2V) and Image-to-video (I2V) generation
+- Audio-to-video (A2V) conditioning — generate video from input audio
 - Four pipeline modes: Distilled, Dev, Dev Two-Stage, and Dev Two-Stage HQ
 - Synchronized audio-video generation (experimental)
 - LoRA support (including HuggingFace repos)
@@ -85,7 +86,27 @@ uv run mlx_video.generate --prompt "A person dancing" --image photo.jpg
 uv run mlx_video.generate --pipeline dev --prompt "Waves crashing" --image beach.png --cfg-scale 3.5
 ```
 
-### Audio-Video (experimental)
+### Audio-to-Video (A2V)
+
+Generate video conditioned on an input audio file. The audio is encoded to latent space and frozen during denoising — the transformer's cross-attention reads the audio signal to guide video generation.
+
+```bash
+# A2V - generate video from audio
+uv run mlx_video.generate --audio-file music.wav --prompt "A band playing music"
+
+# A2V with dev pipeline
+uv run mlx_video.generate --pipeline dev --audio-file ocean.wav --prompt "Ocean waves"
+
+# A2V + I2V (audio + image conditioning)
+uv run mlx_video.generate --audio-file rain.wav --image forest.jpg --prompt "Rain in forest"
+
+# A2V with custom start time
+uv run mlx_video.generate --audio-file song.mp3 --audio-start-time 30.0 --prompt "Concert"
+```
+
+### Audio-Video Generation (experimental)
+
+Generate synchronized audio alongside video from scratch:
 
 ```bash
 uv run mlx_video.generate --prompt "Ocean waves crashing" --audio
@@ -150,6 +171,8 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--image`, `-i` | None | Conditioning image for I2V |
 | `--image-strength` | 1.0 | Conditioning strength for I2V |
 | `--audio`, `-a` | false | Enable synchronized audio generation |
+| `--audio-file` | None | Path to audio file for A2V conditioning |
+| `--audio-start-time` | 0.0 | Start time in seconds for audio file |
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `aggressive`, `conservative` |
 | `--stream` | false | Stream frames as they decode |
 
