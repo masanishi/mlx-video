@@ -1360,7 +1360,7 @@ def load_audio_decoder(model_path: Path, pipeline: PipelineType):
     """Load audio VAE decoder."""
     from mlx_video.models.ltx_2.audio_vae import AudioDecoder
 
-    decoder = AudioDecoder.from_pretrained(model_path / "audio_vae")
+    decoder = AudioDecoder.from_pretrained(model_path / "audio_vae" / "decoder")
 
     return decoder
 

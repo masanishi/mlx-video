@@ -120,6 +120,8 @@ def load_audio_vae_weights(model_path: Path) -> Dict[str, mx.array]:
     """
     # Try different possible paths for audio VAE weights
     audio_vae_paths = [
+        model_path / "audio_vae" / "decoder" / "model.safetensors",
+        model_path / "audio_vae" / "decoder" / "diffusion_pytorch_model.safetensors",
         model_path / "audio_vae" / "diffusion_pytorch_model.safetensors",
         model_path / "audio_vae.safetensors",
     ]
@@ -621,10 +623,10 @@ def convert_audio_encoder(
         source_repo: HF repo containing audio_vae/diffusion_pytorch_model.safetensors.
 
     Returns:
-        Path to the audio_vae_encoder directory.
+        Path to the audio_vae/encoder directory.
     """
     model_path = Path(model_path)
-    encoder_dir = model_path / "audio_vae_encoder"
+    encoder_dir = model_path / "audio_vae" / "encoder"
 
     if (encoder_dir / "model.safetensors").exists():
         return encoder_dir
@@ -643,7 +645,7 @@ def convert_audio_encoder(
     from mlx_video.models.ltx_2.config import AudioEncoderModelConfig
 
     # Build config from the decoder config (same audio VAE architecture)
-    decoder_config_path = model_path / "audio_vae" / "config.json"
+    decoder_config_path = model_path / "audio_vae" / "decoder" / "config.json"
     if decoder_config_path.exists():
         with open(decoder_config_path) as f:
             dec_cfg = json.load(f)

@@ -15,9 +15,13 @@ or Lightricks/LTX-2.3/ltx-2.3-22b-distilled.safetensors) to the modular director
     │   └── encoder/          # Video VAE encoder
     │       ├── config.json
     │       └── model.safetensors
-    ├── audio_vae/            # Audio VAE decoder
-    │   ├── config.json
-    │   └── model.safetensors
+    ├── audio_vae/
+    │   ├── decoder/          # Audio VAE decoder
+    │   │   ├── config.json
+    │   │   └── model.safetensors
+    │   └── encoder/          # Audio VAE encoder
+    │       ├── config.json
+    │       └── model.safetensors
     ├── vocoder/              # Audio vocoder
     │   ├── config.json
     │   └── model.safetensors
@@ -622,9 +626,9 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     # 4. Audio VAE Decoder
     print("  [4/6] Audio VAE Decoder...")
     audio_decoder_weights = sanitize_audio_decoder(all_weights)
-    save_single(audio_decoder_weights, output_path / "audio_vae")
+    save_single(audio_decoder_weights, output_path / "audio_vae" / "decoder")
     config = infer_audio_vae_config(audio_decoder_weights)
-    save_config(config, output_path / "audio_vae")
+    save_config(config, output_path / "audio_vae" / "decoder")
     a_params = sum(v.size for v in audio_decoder_weights.values())
     print(f"    {len(audio_decoder_weights)} keys, {a_params:,} params")
 
