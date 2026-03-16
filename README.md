@@ -88,14 +88,22 @@ uv run mlx_video.generate --pipeline dev --prompt "Waves crashing" --image beach
 
 ### Audio-to-Video (A2V)
 
-Generate video conditioned on an input audio file. The audio is encoded to latent space and frozen during denoising — the transformer's cross-attention reads the audio signal to guide video generation.
+Generate video conditioned on an input audio file. Works with all four pipelines. The audio is encoded to latent space and frozen during denoising — the transformer's cross-attention reads the audio signal to guide video generation.
 
 ```bash
-# A2V - generate video from audio
+# A2V - distilled (default, fastest)
 uv run mlx_video.generate --audio-file music.wav --prompt "A band playing music"
 
-# A2V with dev pipeline
+# A2V - dev (single-stage with CFG)
 uv run mlx_video.generate --pipeline dev --audio-file ocean.wav --prompt "Ocean waves"
+
+# A2V - dev-two-stage (dev + LoRA refinement)
+uv run mlx_video.generate --pipeline dev-two-stage --audio-file music.wav \
+    --prompt "A band playing music" --model-repo prince-canuma/LTX-2-dev
+
+# A2V - dev-two-stage-hq (highest quality)
+uv run mlx_video.generate --pipeline dev-two-stage-hq --audio-file music.wav \
+    --prompt "A band playing music" --model-repo prince-canuma/LTX-2-dev
 
 # A2V + I2V (audio + image conditioning)
 uv run mlx_video.generate --audio-file rain.wav --image forest.jpg --prompt "Rain in forest"
@@ -103,6 +111,8 @@ uv run mlx_video.generate --audio-file rain.wav --image forest.jpg --prompt "Rai
 # A2V with custom start time
 uv run mlx_video.generate --audio-file song.mp3 --audio-start-time 30.0 --prompt "Concert"
 ```
+
+> **Note:** `--audio-file` (A2V) and `--audio` (generate audio) are mutually exclusive. Supported formats: WAV, FLAC, MP3, OGG, and video files with audio tracks.
 
 ### Audio-Video Generation (experimental)
 
