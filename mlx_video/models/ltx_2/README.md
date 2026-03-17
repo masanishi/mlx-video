@@ -155,6 +155,32 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--audio-start-time` | 0.0 | Start time in seconds for audio file |
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `aggressive`, `conservative` |
 | `--stream` | false | Stream frames as they decode |
+| `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below) |
+
+### Spatial Upscalers (LTX-2.3)
+
+LTX-2.3 ships with multiple spatial upscaler variants. Use `--spatial-upscaler` to select one:
+
+| Variant | Scale | Output (from 256x256) | Architecture |
+|---------|-------|-----------------------|--------------|
+| `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` (default) | 2.0x | 512x512 | Conv2d + PixelShuffle(2) |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 2.0x | 512x512 | Same arch, newer weights |
+| `ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors` | 1.5x | 384x384 | Conv2d + PixelShuffle(3) + BlurDownsample |
+
+```bash
+# Default (x2-1.0, auto-detected)
+uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled
+
+# x2-1.1 (newer weights)
+uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
+    --spatial-upscaler ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+
+# x1.5 (smaller output, faster)
+uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
+    --spatial-upscaler ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors
+```
+
+> **Note:** Stage 1 always runs at half the target resolution. With x1.5, the final output is 75% of `--width`/`--height` (e.g., 512 target -> 256 stage 1 -> 384 output). With x2, the output matches the target exactly.
 
 ### Dev / Dev-Two-Stage
 
@@ -189,8 +215,8 @@ HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses t
 
 ### Distilled Pipeline (default)
 1. **Stage 1**: Generate at half resolution with 8 denoising steps (fixed sigmas)
-2. **Upsample**: 2x spatial upsampling via LatentUpsampler
-3. **Stage 2**: Refine at full resolution with 3 denoising steps
+2. **Upsample**: Spatial upsampling via LatentUpsampler (x2 or x1.5, selectable via `--spatial-upscaler`)
+3. **Stage 2**: Refine at upsampled resolution with 3 denoising steps
 4. **Decode**: VAE decoder converts latents to RGB video
 
 ### Dev Pipeline
@@ -199,14 +225,14 @@ HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses t
 
 ### Dev Two-Stage Pipeline
 1. **Stage 1**: Dev denoising at half resolution with CFG
-2. **Upsample**: 2x spatial upsampling via LatentUpsampler
-3. **Stage 2**: Distilled refinement at full resolution with LoRA weights (3 steps, no CFG)
+2. **Upsample**: Spatial upsampling via LatentUpsampler (x2 or x1.5)
+3. **Stage 2**: Distilled refinement at upsampled resolution with LoRA weights (3 steps, no CFG)
 4. **Decode**: VAE decoder converts latents to RGB video
 
 ### Dev Two-Stage HQ Pipeline
 1. **Stage 1**: res_2s denoising at half resolution with CFG + LoRA@0.25 (15 steps, 2 evals/step)
-2. **Upsample**: 2x spatial upsampling via LatentUpsampler
-3. **Stage 2**: res_2s refinement at full resolution with LoRA@0.5 (3 steps, no CFG)
+2. **Upsample**: Spatial upsampling via LatentUpsampler (x2 or x1.5)
+3. **Stage 2**: res_2s refinement at upsampled resolution with LoRA@0.5 (3 steps, no CFG)
 4. **Decode**: VAE decoder converts latents to RGB video
 
 The res_2s sampler uses an exponential Rosenbrock-type Runge-Kutta integrator with SDE noise injection, producing higher quality results than Euler at the same compute budget (~30 total model evaluations).
