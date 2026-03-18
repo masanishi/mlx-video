@@ -331,7 +331,7 @@ class TestEndToEnd:
     """End-to-end LoRA loading and application."""
 
     def test_load_and_apply_loras(self):
-        from mlx_video.convert_wan import load_and_apply_loras
+        from mlx_video.models.wan2.convert import load_and_apply_loras
 
         with tempfile.TemporaryDirectory() as tmp:
             # Create mock LoRA safetensors

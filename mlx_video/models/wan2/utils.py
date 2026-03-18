@@ -21,12 +21,12 @@ def load_wan_model(
                       If provided, creates QuantizedLinear stubs before loading.
         loras: Optional list of (lora_path, strength) tuples to apply.
     """
-    from mlx_video.models.wan.model import WanModel
+    from mlx_video.models.wan2.model import WanModel
 
     model = WanModel(config)
 
     if quantization:
-        from mlx_video.convert_wan import _quantize_predicate
+        from mlx_video.models.wan2.convert import _quantize_predicate
 
         nn.quantize(
             model,
@@ -42,7 +42,7 @@ def load_wan_model(
         if quantization:
             # Dequantize LoRA-targeted layers, merge delta, replace with bf16 Linear.
             # Non-LoRA layers stay 4-bit. Zero per-step overhead.
-            from mlx_video.convert_wan import _load_lora_configs
+            from mlx_video.models.wan2.convert import _load_lora_configs
             from mlx_video.lora import apply_loras_to_model
 
             model.load_weights(list(weights.items()), strict=False)
@@ -53,7 +53,7 @@ def load_wan_model(
             return model
         else:
             # Weight merging: fold LoRA into bf16 weights before loading
-            from mlx_video.convert_wan import load_and_apply_loras
+            from mlx_video.models.wan2.convert import load_and_apply_loras
 
             weights = load_and_apply_loras(dict(weights), loras)
 
@@ -69,7 +69,7 @@ def load_t5_encoder(model_path: Path, config):
     only runs once per generation, so performance impact is negligible.
     This matches the official which computes softmax in float32 explicitly.
     """
-    from mlx_video.models.wan.text_encoder import T5Encoder
+    from mlx_video.models.wan2.text_encoder import T5Encoder
 
     encoder = T5Encoder(
         vocab_size=config.t5_vocab_size,
@@ -97,11 +97,11 @@ def load_vae_decoder(model_path: Path, config=None):
     is_wan22 = config is not None and config.vae_z_dim == 48
 
     if is_wan22:
-        from mlx_video.models.wan.vae22 import Wan22VAEDecoder
+        from mlx_video.models.wan2.vae22 import Wan22VAEDecoder
 
         vae = Wan22VAEDecoder(z_dim=48)
     else:
-        from mlx_video.models.wan.vae import WanVAE
+        from mlx_video.models.wan2.vae import WanVAE
 
         vae = WanVAE(z_dim=16)
 
@@ -120,11 +120,11 @@ def load_vae_encoder(model_path: Path, config=None):
     For Wan2.1/I2V-14B (vae_z_dim=16), uses WanVAE with encoder=True.
     """
     if config is not None and config.vae_z_dim == 16:
-        from mlx_video.models.wan.vae import WanVAE
+        from mlx_video.models.wan2.vae import WanVAE
 
         vae = WanVAE(z_dim=16, encoder=True)
     else:
-        from mlx_video.models.wan.vae22 import Wan22VAEEncoder
+        from mlx_video.models.wan2.vae22 import Wan22VAEEncoder
 
         vae = Wan22VAEEncoder(z_dim=config.vae_z_dim if config else 48)
 

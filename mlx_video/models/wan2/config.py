@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Tuple, Union
 
-from mlx_video.models.ltx.config import BaseModelConfig
+from mlx_video.models.ltx_2.config import BaseModelConfig
 
 
 @dataclass
