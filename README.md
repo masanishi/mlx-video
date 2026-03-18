@@ -17,18 +17,21 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 ## Supported Models
 
 ### LTX-2
+[LTX-2](https://huggingface.co/Lightricks/LTX-Video) is 19B parameter video generation model from Lightricks
 
-[LTX-2](https://huggingface.co/Lightricks/LTX-2) is a 19B parameter video generation model from Lightricks. See the full [LTX-2 model card](mlx_video/models/ltx_2/README.md) for detailed usage, CLI options, pipeline descriptions, and architecture.
+## Features
 
-**Features:**
-- Text-to-Video (T2V), Image-to-Video (I2V), and Audio-to-Video (A2V)
-- Four pipelines: Distilled (fast), Dev (CFG), Dev Two-Stage (LoRA), Dev Two-Stage HQ (highest quality)
-- Synchronized audio-video generation (experimental)
-- LoRA support (local files or HuggingFace repos)
-- Prompt enhancement via Gemma
+- Text-to-video generation with the LTX-2 19B DiT model
+- Two-stage generation pipeline for high-quality output
 - 2x spatial upscaling for images and videos
+- Optimized for Apple Silicon using MLX
 
-**Quick start:**
+
+## Usage
+
+> **ℹ️ Info:** Currently, only the distilled variant is supported. Full LTX-2 feature support is coming soon.
+
+### Text-to-Video Generation
 
 ```bash
 # Text-to-Video (distilled, fastest)
@@ -56,15 +59,69 @@ uv run mlx_video.generate --pipeline dev-two-stage-hq \
 Pre-converted weights are available on HuggingFace ([LTX-2-distilled](https://huggingface.co/prince-canuma/LTX-2-distilled), [LTX-2-dev](https://huggingface.co/prince-canuma/LTX-2-dev), [LTX-2.3-distilled](https://huggingface.co/prince-canuma/LTX-2.3-distilled), [LTX-2.3-dev](https://huggingface.co/prince-canuma/LTX-2.3-dev)), or convert from the original Lightricks checkpoint:
 
 ```bash
-uv run python -m mlx_video.models.ltx_2.convert \
-    --source Lightricks/LTX-2 --output ./LTX-2-distilled --variant distilled
+python -m mlx_video.generate \
+    --prompt "Ocean waves crashing on a beach at sunset" \
+    --height 768 \
+    --width 768 \
+    --num-frames 65 \
+    --seed 123 \
+    --output my_video.mp4
 ```
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prompt`, `-p` | (required) | Text description of the video |
+| `--height`, `-H` | 512 | Output height (must be divisible by 64) |
+| `--width`, `-W` | 512 | Output width (must be divisible by 64) |
+| `--num-frames`, `-n` | 100 | Number of frames |
+| `--seed`, `-s` | 42 | Random seed for reproducibility |
+| `--fps` | 24 | Frames per second |
+| `--output`, `-o` | output.mp4 | Output video path |
+| `--save-frames` | false | Save individual frames as images |
+| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+
+## How It Works
+
+The pipeline uses a two-stage generation process:
+
+1. **Stage 1**: Generate at half resolution (e.g., 384x384) with 8 denoising steps
+2. **Upsample**: 2x spatial upsampling via LatentUpsampler
+3. **Stage 2**: Refine at full resolution (e.g., 768x768) with 3 denoising steps
+4. **Decode**: VAE decoder converts latents to RGB video
 
 ## Requirements
 
 - macOS with Apple Silicon
 - Python >= 3.11
 - MLX >= 0.22.0
+
+## Model Specifications
+
+- **Transformer**: 48 layers, 32 attention heads, 128 dim per head
+- **Latent channels**: 128
+- **Text encoder**: Gemma 3 with 3840-dim output
+- **RoPE**: Split mode with double precision
+
+## Project Structure
+
+```
+mlx_video/
+├── generate.py             # Video generation pipeline
+├── convert.py              # Weight conversion (PyTorch -> MLX)
+├── postprocess.py          # Video post-processing utilities
+├── utils.py                # Helper functions
+└── models/
+    └── ltx/
+        ├── ltx.py          # Main LTXModel (DiT transformer)
+        ├── config.py       # Model configuration
+        ├── transformer.py  # Transformer blocks
+        ├── attention.py    # Multi-head attention with RoPE
+        ├── text_encoder.py # Text encoder
+        ├── upsampler.py    # 2x spatial upsampler
+        └── video_vae/      # VAE encoder/decoder
+```
 
 ## License
 

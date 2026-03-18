@@ -1,4 +1,5 @@
 from mlx_video.models.ltx_2 import LTXModel, LTXModelConfig
+from mlx_video.models.wan import WanModel, WanModelConfig
 
 # Audio VAE components
 from mlx_video.models.ltx_2.audio_vae import (
@@ -29,6 +30,7 @@ __all__ = [
     # Models
     "LTXModel",
     "LTXModelConfig",
+
     # Audio VAE
     "AudioDecoder",
     "AudioEncoder",
@@ -45,4 +47,7 @@ __all__ = [
     "load_safetensors",
     "load_config",
     "save_weights",
+    # Wan Models
+    "WanModel",
+    "WanModelConfig",
 ]
