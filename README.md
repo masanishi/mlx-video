@@ -99,12 +99,12 @@ See the dedicated Wan2.1/Wan2.2 [README.md](mlx_video/models/wan/README.md) for 
 
 ```bash
 # Wan2.1 — uses defaults from config (50 steps, shift=5.0, guide=5.0)
-python -m mlx_video.wan.generate \
+python -m mlx_video.wan2.generate \
     --model-dir wan21_mlx \
     --prompt "A cat playing piano in a cozy room"
 
 # Wan2.2 — uses defaults from config (40 steps, shift=12.0, guide=3.0,4.0)
-python -m mlx_video.wan.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir wan22_mlx \
     --prompt "A cat playing piano in a cozy room"
 ```
@@ -112,7 +112,7 @@ python -m mlx_video.wan.generate_wan \
 With custom settings:
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir wan21_mlx \
     --prompt "Ocean waves at sunset, cinematic, 4K" \
     --negative-prompt "blurry, low quality" \
@@ -131,7 +131,7 @@ The pipeline auto-detects the model version from `config.json` and selects the r
 ### Image-to-Video (I2V-14B)
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir wan22_i2v_mlx \
     --prompt "The camera slowly zooms in as the subject begins to move" \
     --image start.png \
@@ -146,7 +146,7 @@ LoRAs can be used with the `--lora-high` and `--lora-low` command line switches.
 For example, using the distilled [Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) LoRA for 4-step generation:
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_vide.wan2.generate \
     --model-dir /Volumes/SSD/Wan-AI/Wan2.2-T2V-A14B-MLX \
     --width 480 \
     --height 704 \
