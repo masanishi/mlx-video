@@ -966,7 +966,7 @@ class Wan22VAEDecoder(nn.Module):
         Returns:
             video: [B, T', H', W', 3] decoded RGB in [-1, 1]
         """
-        from mlx_video.models.wan2.tiling import TilingConfig, decode_with_tiling
+        from mlx_video.models.wan_2.tiling import TilingConfig, decode_with_tiling
 
         if tiling_config is None:
             tiling_config = TilingConfig.default()
