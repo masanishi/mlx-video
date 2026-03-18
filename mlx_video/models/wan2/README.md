@@ -70,7 +70,7 @@ The conversion script auto-detects the model version from the directory structur
 #### Wan2.1 T2V 1.3B
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.1-T2V-1.3B \
     --output-dir ./Wan2.1-T2V-1.3B-MLX
 ```
@@ -78,7 +78,7 @@ python -m mlx_video.convert_wan \
 #### Wan2.1 T2V 14B
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.1-T2V-14B \
     --output-dir ./Wan2.1-T2V-14B-MLX
 ```
@@ -86,7 +86,7 @@ python -m mlx_video.convert_wan \
 #### Wan2.2 T2V 14B
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-T2V-A14B \
     --output-dir ./Wan2.2-T2V-A14B-MLX
 ```
@@ -94,7 +94,7 @@ python -m mlx_video.convert_wan \
 #### Wan2.2 I2V 14B
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-I2V-A14B \
     --output-dir ./Wan2.2-I2V-A14B-MLX
 ```
@@ -104,7 +104,7 @@ The I2V model is auto-detected from `config.json`; the output will include a `va
 #### Wan2.2 TI2V 5B
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-TI2V-5B \
     --output-dir ./Wan2.2-TI2V-5B-MLX
 ```
@@ -144,7 +144,7 @@ wan_mlx/
 #### Wan2.1 T2V 1.3B
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.gemer \
     --model-dir ./Wan2.1-T2V-1.3B-MLX \
     --prompt "A cat playing piano in a cozy living room, cinematic lighting" \
     --width 832 --height 480 --num-frames 81 \
@@ -156,7 +156,7 @@ python -m mlx_video.generate_wan \
 #### Wan2.1 T2V 14B
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.gemer \
     --model-dir ./Wan2.1-T2V-14B-MLX \
     --prompt "A woman walks through a misty forest at dawn, slow motion, cinematic" \
     --width 1280 --height 704 --num-frames 81 \
@@ -172,7 +172,7 @@ python -m mlx_video.generate_wan \
 Wan2.2 uses a dual-model pipeline (separate high-noise and low-noise transformers) and takes guidance as a `high,low` pair:
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir ./Wan2.2-T2V-A14B-MLX \
     --prompt "Two astronauts playing chess on the surface of the moon, dramatic lighting, 8K" \
     --negative-prompt "low quality, blurry, distorted" \
@@ -189,7 +189,7 @@ python -m mlx_video.generate_wan \
 Image-to-video: animates a starting image guided by a text prompt. Pass the image with `--image`:
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir ./Wan2.2-I2V-A14B-MLX \
     --image ./my_photo.png \
     --prompt "The person slowly turns their head and smiles, cinematic, natural lighting" \
@@ -207,7 +207,7 @@ python -m mlx_video.generate_wan \
 Text+image-to-video: a single-model variant with a larger VAE (`z_dim=48`). Resolution must be divisible by **32** (not 16 as with other models):
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir ./Wan2.2-TI2V-5B-MLX \
     --image ./my_photo.png \
     --prompt "The subject waves hello, warm sunlight, film grain" \
@@ -251,27 +251,27 @@ Quantize the transformer weights to reduce memory usage by ~3.4×. Quantization 
 
 ```bash
 # Convert with 4-bit quantization (works for any variant)
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.1-T2V-1.3B \
     --output-dir ./Wan2.1-T2V-1.3B-MLX-Q4 \
     --quantize --bits 4 --group-size 64
 
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.1-T2V-14B \
     --output-dir ./Wan2.1-T2V-14B-MLX-Q4 \
     --quantize --bits 4 --group-size 64
 
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-T2V-A14B \
     --output-dir ./Wan2.2-T2V-A14B-MLX-Q4 \
     --quantize --bits 4 --group-size 64
 
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-I2V-A14B \
     --output-dir ./Wan2.2-I2V-A14B-MLX-Q4 \
     --quantize --bits 4 --group-size 64
 
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-TI2V-5B \
     --output-dir ./Wan2.2-TI2V-5B-MLX-Q4 \
     --quantize --bits 4 --group-size 64
@@ -280,7 +280,7 @@ python -m mlx_video.convert_wan \
 You can also quantize an already-converted MLX model without re-converting from PyTorch:
 
 ```bash
-python -m mlx_video.convert_wan \
+python -m mlx_video.wan2.convert \
     --checkpoint-dir ./Wan2.2-T2V-A14B-MLX \
     --output-dir ./Wan2.2-T2V-A14B-MLX-Q4 \
     --quantize-only --bits 4
@@ -289,7 +289,7 @@ python -m mlx_video.convert_wan \
 Quantized models are used exactly the same way — the quantization is auto-detected from `config.json`:
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir ./Wan2.2-T2V-A14B-MLX-Q4 \
     --prompt "A cat playing piano"
 ```
@@ -330,7 +330,7 @@ LoRA's can be used with the `--lora-high` and `--lora-low` command line switches
 For example, for using the the distilled [Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) LoRA, use the following command. Lightning speeds up generation by using only 4 steps and a CFG scale of 1.
 
 ```bash
-python -m mlx_video.generate_wan \
+python -m mlx_video.wan2.generate \
     --model-dir /Volumes/SSD/Wan-AI/Wan2.2-T2V-A14B-MLX \
     --width 480 \
     --height 704 \
