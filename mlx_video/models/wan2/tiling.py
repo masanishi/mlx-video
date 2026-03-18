@@ -6,7 +6,7 @@ for non-causal temporal decoders (e.g. Wan2.1 where T latent frames → T*scale
 output frames rather than LTX's 1+(T-1)*scale mapping).
 
 # TODO: This function can be refactored to consolidate with
-# mlx_video.models.ltx.video_vae.tiling.decode_with_tiling once the
+# mlx_video.models.ltx_2.video_vae.tiling.decode_with_tiling once the
 # causal_temporal generalisation is accepted upstream.
 """
 
@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 import mlx.core as mx
 
-from mlx_video.models.ltx.video_vae.tiling import (
+from mlx_video.models.ltx_2.video_vae.tiling import (
     SpatialTilingConfig,
     TemporalTilingConfig,
     TilingConfig,

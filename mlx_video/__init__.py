@@ -22,7 +22,7 @@ from mlx_video.models.ltx_2.utils import (
     load_safetensors,
     save_weights,
 )
-from mlx_video.models.wan import WanModel, WanModelConfig
+from mlx_video.models.wan2 import WanModel, WanModelConfig
 
 __all__ = [
     # Models
