@@ -1821,6 +1821,30 @@ class MemoryProfiler:
         return self.overall_peak
 
 
+def resolve_decode_tiling_mode(
+    tiling: str,
+    *,
+    low_memory: bool,
+    height: int,
+    width: int,
+    num_frames: int,
+) -> str:
+    """Choose the decode tiling mode, escalating to aggressive for huge low-memory decodes.
+
+    Conservative tiling keeps larger tiles for better throughput, but on very large
+    videos the per-tile VAE working set can still spike badly. For low-memory runs we
+    prefer smaller decode tiles once the output volume gets large enough.
+    """
+    if not low_memory or tiling != "conservative":
+        return tiling
+
+    output_pixels = height * width * num_frames
+    if output_pixels >= 75_000_000:
+        return "aggressive"
+
+    return tiling
+
+
 def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
     """Save audio to WAV file."""
     import wave
@@ -2421,6 +2445,14 @@ def generate_video(
         mx.clear_cache()
         memory_profiler.log("stage 1 complete")
 
+        if low_memory_stage2_video_only:
+            memory_profiler.start("stage 2 model trim")
+            console.print(
+                "[dim]Low-memory: stripping transformer audio/cross-modal modules before upsampling[/]"
+            )
+            strip_transformer_to_video_only(transformer)
+            memory_profiler.log("stage 2 model trimmed")
+
         # Upsample latents
         memory_profiler.start("upsample")
         with console.status(
@@ -2445,14 +2477,6 @@ def generate_video(
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
         memory_profiler.log("upsample complete")
-
-        if low_memory_stage2_video_only:
-            memory_profiler.start("stage 2 model trim")
-            console.print(
-                "[dim]Low-memory: stripping transformer audio/cross-modal modules before Stage 2[/]"
-            )
-            strip_transformer_to_video_only(transformer)
-            memory_profiler.log("stage 2 model trimmed")
 
         # Stage 2
         console.print(
@@ -3213,23 +3237,37 @@ def generate_video(
     console.print("\n[blue]🎞️  Decoding video...[/]")
     memory_profiler.start("video decode")
 
+    decode_tiling_mode = resolve_decode_tiling_mode(
+        tiling,
+        low_memory=low_memory,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+    )
+    if decode_tiling_mode != tiling:
+        console.print(
+            f"[dim]Low-memory decode tiling escalated: {tiling} → {decode_tiling_mode}[/]"
+        )
+
     # Select tiling configuration
-    if tiling == "none":
+    if decode_tiling_mode == "none":
         tiling_config = None
-    elif tiling == "auto":
+    elif decode_tiling_mode == "auto":
         tiling_config = TilingConfig.auto(height, width, num_frames)
-    elif tiling == "default":
+    elif decode_tiling_mode == "default":
         tiling_config = TilingConfig.default()
-    elif tiling == "aggressive":
+    elif decode_tiling_mode == "aggressive":
         tiling_config = TilingConfig.aggressive()
-    elif tiling == "conservative":
+    elif decode_tiling_mode == "conservative":
         tiling_config = TilingConfig.conservative()
-    elif tiling == "spatial":
+    elif decode_tiling_mode == "spatial":
         tiling_config = TilingConfig.spatial_only()
-    elif tiling == "temporal":
+    elif decode_tiling_mode == "temporal":
         tiling_config = TilingConfig.temporal_only()
     else:
-        console.print(f"[yellow]  Unknown tiling mode '{tiling}', using auto[/]")
+        console.print(
+            f"[yellow]  Unknown tiling mode '{decode_tiling_mode}', using auto[/]"
+        )
         tiling_config = TilingConfig.auto(height, width, num_frames)
 
     output_path = Path(output_path)
@@ -3282,12 +3320,12 @@ def generate_video(
             else "none"
         )
         console.print(
-            f"[dim]  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}[/]"
+            f"[dim]  Tiling ({decode_tiling_mode}): spatial={spatial_info}, temporal={temporal_info}[/]"
         )
         video = vae_decoder.decode_tiled(
             latents,
             tiling_config=tiling_config,
-            tiling_mode=tiling,
+            tiling_mode=decode_tiling_mode,
             debug=verbose,
             on_frames_ready=on_frames_ready,
         )
