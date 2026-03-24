@@ -4,6 +4,7 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 """
 
 import argparse
+import gc
 import math
 import time
 from enum import Enum
@@ -33,7 +34,8 @@ from mlx_video.models.ltx_2.conditioning import (
     apply_conditioning,
 )
 from mlx_video.models.ltx_2.conditioning.latent import LatentState, apply_denoise_mask
-from mlx_video.models.ltx_2.ltx_2 import LTXModel
+from mlx_video.models.ltx_2.config import LTXModelType
+from mlx_video.models.ltx_2.ltx_2 import LTXModel, TransformerArgsPreprocessor
 from mlx_video.models.ltx_2.transformer import Modality
 from mlx_video.models.ltx_2.upsampler import load_upsampler, upsample_latents
 from mlx_video.models.ltx_2.video_vae import VideoEncoder
@@ -1626,6 +1628,199 @@ def load_vocoder_model(model_path: Path, pipeline: PipelineType):
     return _load_vocoder(model_path / "vocoder")
 
 
+def encode_conditioning_image_latent(
+    model_path: Path,
+    image_path: str,
+    height: int,
+    width: int,
+    dtype: mx.Dtype,
+) -> mx.array:
+    """Encode a single conditioning image into video latent space.
+
+    Loads the VAE encoder on demand, performs aspect-ratio-preserving preprocessing,
+    encodes the image, and releases the encoder immediately afterwards to keep
+    peak memory lower during multi-stage generation.
+    """
+    vae_encoder = VideoEncoder.from_pretrained(model_path / "vae" / "encoder")
+
+    input_image = load_image(image_path, height=height, width=width, dtype=dtype)
+    image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=dtype)
+    image_latent = vae_encoder(image_tensor)
+    mx.eval(image_latent)
+
+    del vae_encoder
+    mx.clear_cache()
+    return image_latent
+
+
+def load_video_decoder_statistics(model_path: Path) -> tuple[mx.array, mx.array]:
+    """Load VideoDecoder only long enough to fetch per-channel latent statistics."""
+    vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+    mean = vae_decoder.per_channel_statistics.mean
+    std = vae_decoder.per_channel_statistics.std
+    mx.eval(mean, std)
+    del vae_decoder
+    mx.clear_cache()
+    return mean, std
+
+
+def set_attention_query_chunk_size(model: LTXModel, query_chunk_size: Optional[int]) -> None:
+    """Configure query-chunking across all transformer attention modules.
+
+    This reduces attention workspace by evaluating Q in smaller slices while reusing
+    the same K/V tensors. Useful for long full-resolution Stage 2 passes.
+    """
+    transformer_blocks = getattr(model, "transformer_blocks", None)
+    if transformer_blocks is None:
+        return
+
+    attention_names = (
+        "attn1",
+        "attn2",
+        "audio_attn1",
+        "audio_attn2",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+    )
+    for block in transformer_blocks.values():
+        for name in attention_names:
+            attention = getattr(block, name, None)
+            if attention is not None:
+                attention.query_chunk_size = query_chunk_size
+
+
+def strip_transformer_to_video_only(model: LTXModel) -> None:
+    """Drop audio/cross-modal modules so Stage 2 can run with a smaller resident model.
+
+    This is intended for low-memory two-stage execution after Stage 1 has finished and
+    audio latents are no longer refined. The function mutates the loaded transformer
+    in-place, preserving the video path while deleting audio-only and A/V cross-modal
+    modules to release unified memory before Stage 2.
+    """
+    video_preprocessor = getattr(model, "video_args_preprocessor", None)
+    simple_preprocessor = getattr(video_preprocessor, "simple_preprocessor", None)
+    if simple_preprocessor is not None:
+        model.video_args_preprocessor = TransformerArgsPreprocessor(
+            patchify_proj=simple_preprocessor.patchify_proj,
+            adaln=simple_preprocessor.adaln,
+            caption_projection=simple_preprocessor.caption_projection,
+            inner_dim=simple_preprocessor.inner_dim,
+            max_pos=simple_preprocessor.max_pos,
+            num_attention_heads=simple_preprocessor.num_attention_heads,
+            use_middle_indices_grid=simple_preprocessor.use_middle_indices_grid,
+            timestep_scale_multiplier=simple_preprocessor.timestep_scale_multiplier,
+            positional_embedding_theta=simple_preprocessor.positional_embedding_theta,
+            rope_type=simple_preprocessor.rope_type,
+            double_precision_rope=simple_preprocessor.double_precision_rope,
+            prompt_adaln=simple_preprocessor.prompt_adaln,
+        )
+
+    top_level_attrs = (
+        "audio_positional_embedding_max_pos",
+        "audio_num_attention_heads",
+        "audio_inner_dim",
+        "audio_cross_attention_dim",
+        "audio_patchify_proj",
+        "audio_adaln_single",
+        "audio_prompt_adaln_single",
+        "audio_caption_projection",
+        "audio_scale_shift_table",
+        "audio_norm_out",
+        "audio_proj_out",
+        "audio_args_preprocessor",
+        "av_ca_video_scale_shift_adaln_single",
+        "av_ca_audio_scale_shift_adaln_single",
+        "av_ca_a2v_gate_adaln_single",
+        "av_ca_v2a_gate_adaln_single",
+        "av_ca_timestep_scale_multiplier",
+    )
+    for attr in top_level_attrs:
+        if hasattr(model, attr):
+            delattr(model, attr)
+
+    block_attrs = (
+        "audio_attn1",
+        "audio_attn2",
+        "audio_ff",
+        "audio_scale_shift_table",
+        "audio_prompt_scale_shift_table",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+        "scale_shift_table_a2v_ca_audio",
+        "scale_shift_table_a2v_ca_video",
+    )
+    transformer_blocks = getattr(model, "transformer_blocks", {})
+    for block in transformer_blocks.values():
+        for attr in block_attrs:
+            if hasattr(block, attr):
+                delattr(block, attr)
+
+    if hasattr(model, "model_type"):
+        model.model_type = LTXModelType.VideoOnly
+    if hasattr(model, "config"):
+        model.config.model_type = LTXModelType.VideoOnly
+
+    gc.collect()
+    mx.clear_cache()
+
+
+class MemoryProfiler:
+    """Phase-local MLX memory profiler using active/cache/peak counters."""
+
+    def __init__(self, enabled: bool, console: Console):
+        self.enabled = enabled
+        self.console = console
+        self.current_phase: Optional[str] = None
+        self.phase_start_active = 0
+        self.phase_start_cache = 0
+        self.overall_peak = 0
+
+    @staticmethod
+    def _gib(value: int) -> float:
+        return value / (1024**3)
+
+    def _update_overall_peak(self, peak: int) -> None:
+        self.overall_peak = max(self.overall_peak, peak)
+
+    def start(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        mx.eval()
+        self.current_phase = phase
+        mx.reset_peak_memory()
+        self.phase_start_active = mx.get_active_memory()
+        self.phase_start_cache = mx.get_cache_memory()
+
+    def log(self, phase: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        mx.eval()
+        label = phase or self.current_phase or "phase"
+        active = mx.get_active_memory()
+        cache = mx.get_cache_memory()
+        peak = mx.get_peak_memory()
+        self._update_overall_peak(peak)
+        delta_active = active - self.phase_start_active
+        delta_cache = cache - self.phase_start_cache
+        self.console.print(
+            "[dim]🧠 {label}: active={active:.2f}GB (Δ{delta_active:+.2f}), "
+            "cache={cache:.2f}GB (Δ{delta_cache:+.2f}), peak={peak:.2f}GB[/]".format(
+                label=label,
+                active=self._gib(active),
+                delta_active=self._gib(delta_active),
+                cache=self._gib(cache),
+                delta_cache=self._gib(delta_cache),
+                peak=self._gib(peak),
+            )
+        )
+
+    def final_peak(self) -> int:
+        if not self.enabled:
+            return mx.get_peak_memory()
+        self._update_overall_peak(mx.get_peak_memory())
+        return self.overall_peak
+
+
 def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
     """Save audio to WAV file."""
     import wave
@@ -1753,6 +1948,8 @@ def generate_video(
     audio_file: Optional[str] = None,
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
+    low_memory: bool = False,
+    profile_memory: bool = False,
 ):
     """Generate video using LTX-2 / LTX-2.3 models.
 
@@ -1791,8 +1988,11 @@ def generate_video(
         use_apg: Use Adaptive Projected Guidance instead of CFG (more stable for I2V)
         apg_eta: APG parallel component weight (1.0 = keep full parallel)
         apg_norm_threshold: APG guidance norm clamp (0 = no clamping)
+        low_memory: Apply safer low-memory defaults for Apple Silicon execution.
+        profile_memory: Print phase-local MLX memory measurements.
     """
     start_time = time.time()
+    memory_profiler = MemoryProfiler(enabled=profile_memory, console=console)
 
     # Validate dimensions
     is_two_stage = pipeline in (
@@ -1820,6 +2020,33 @@ def generate_video(
     # A2V implicitly enables audio path through the transformer
     if is_a2v:
         audio = True
+
+    low_memory_adjustments = []
+    low_memory_stage2_video_only = False
+    attention_query_chunk_size = None
+    if low_memory:
+        if tiling in ("auto", "none", "default"):
+            tiling = "conservative"
+            low_memory_adjustments.append("tiling=conservative")
+        if pipeline in (
+            PipelineType.DEV,
+            PipelineType.DEV_TWO_STAGE,
+            PipelineType.DEV_TWO_STAGE_HQ,
+        ):
+            if stg_scale != 0.0:
+                stg_scale = 0.0
+                low_memory_adjustments.append("stg=off")
+            if modality_scale != 1.0:
+                modality_scale = 1.0
+                low_memory_adjustments.append("modality-guidance=off")
+        if audio and pipeline in (PipelineType.DISTILLED, PipelineType.DEV_TWO_STAGE):
+            low_memory_stage2_video_only = True
+            low_memory_adjustments.append("stage2-audio-refine=off")
+        attention_query_chunk_size = 2048
+        low_memory_adjustments.append(
+            f"query-chunk={attention_query_chunk_size}"
+        )
+
     mode_str = "I2V" if is_i2v else "T2V"
     if is_a2v:
         mode_str = "A2V" + ("+I2V" if is_i2v else "")
@@ -1836,6 +2063,11 @@ def generate_video(
     header = f"[bold cyan]🎬 [{pipeline_name}] [{mode_str}] {width}x{height} • {num_frames} frames[/]"
     console.print(Panel(header, expand=False))
     console.print(f"[dim]Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}[/]")
+    if low_memory:
+        adjustments = ", ".join(low_memory_adjustments) if low_memory_adjustments else "none"
+        console.print(f"[dim]Low-memory mode: on ({adjustments})[/]")
+    if profile_memory:
+        console.print("[dim]Memory profiling: on[/]")
 
     if pipeline in (
         PipelineType.DEV,
@@ -1921,6 +2153,7 @@ def generate_video(
             has_prompt_adaln = json.load(f).get("has_prompt_adaln", False)
 
     # Load text encoder
+    memory_profiler.start("text encoder")
     with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
         from mlx_video.models.ltx_2.text_encoder import LTX2TextEncoder
 
@@ -1977,15 +2210,19 @@ def generate_video(
 
     del text_encoder
     mx.clear_cache()
+    memory_profiler.log("text embeddings ready")
 
     # Load transformer
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
+    memory_profiler.start("transformer load")
     with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
         transformer = LTXModel.from_pretrained(
             model_path=model_path / "transformer", strict=True
         )
+        set_attention_query_chunk_size(transformer, attention_query_chunk_size)
 
     console.print("[green]✓[/] Transformer loaded")
+    memory_profiler.log("transformer loaded")
 
     # Auto-detect stg_blocks from transformer config if not explicitly provided.
     # LTX-2.3 (has_prompt_adaln=True) uses block 28; LTX-2 uses block 29.
@@ -2013,6 +2250,7 @@ def generate_video(
         )
         from mlx_video.models.ltx_2.utils import convert_audio_encoder
 
+        memory_profiler.start("a2v encode")
         with console.status(
             "[blue]Loading and encoding input audio (A2V)...[/]", spinner="dots"
         ):
@@ -2072,6 +2310,7 @@ def generate_video(
         console.print(
             f"[green]✓[/] Audio encoded ({a2v_audio_latents.shape[2]} frames from {audio_file})"
         )
+        memory_profiler.log("a2v encoded")
 
     # ==========================================================================
     # Pipeline-specific generation logic
@@ -2084,38 +2323,19 @@ def generate_video(
 
         # Load VAE encoder for I2V
         stage1_image_latent = None
-        stage2_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"
+                "[blue]🖼️  Encoding Stage 1 image conditioning...[/]", spinner="dots"
             ):
-                vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
-                )
-
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
-                input_image = load_image(
-                    image, height=s1_h, width=s1_w, dtype=model_dtype
+                stage1_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s1_h,
+                    width=s1_w,
+                    dtype=model_dtype,
                 )
-                stage1_image_tensor = prepare_image_for_encoding(
-                    input_image, s1_h, s1_w, dtype=model_dtype
-                )
-                stage1_image_latent = vae_encoder(stage1_image_tensor)
-                mx.eval(stage1_image_latent)
-
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                input_image = load_image(
-                    image, height=s2_h, width=s2_w, dtype=model_dtype
-                )
-                stage2_image_tensor = prepare_image_for_encoding(
-                    input_image, s2_h, s2_w, dtype=model_dtype
-                )
-                stage2_image_latent = vae_encoder(stage2_image_tensor)
-                mx.eval(stage2_image_latent)
-
-                del vae_encoder
-                mx.clear_cache()
-            console.print("[green]✓[/] VAE encoder loaded and image encoded")
+            console.print("[green]✓[/] Stage 1 image conditioning encoded")
 
         # Merge distilled LoRA before stage 1 so it affects the full distilled
         # pipeline (stage 1 generation + stage 2 refinement) with a single merge.
@@ -2130,6 +2350,7 @@ def generate_video(
         console.print(
             f"\n[bold yellow]⚡ Stage 1:[/] Generating at {stage1_w*32}x{stage1_h*32} (8 steps)"
         )
+        memory_profiler.start("stage 1 denoise")
         mx.random.seed(seed)
 
         positions = create_position_grid(1, latent_frames, stage1_h, stage1_w)
@@ -2193,7 +2414,15 @@ def generate_video(
             audio_frozen=is_a2v,
         )
 
+        if state1 is not None:
+            del state1
+        if stage1_image_latent is not None:
+            del stage1_image_latent
+        mx.clear_cache()
+        memory_profiler.log("stage 1 complete")
+
         # Upsample latents
+        memory_profiler.start("upsample")
         with console.status(
             f"[magenta]🔍 Upsampling latents {upscaler_scale}x...[/]", spinner="dots"
         ):
@@ -2202,29 +2431,56 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+            vae_mean, vae_std = load_video_decoder_statistics(model_path)
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                vae_mean,
+                vae_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, vae_mean, vae_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
+        memory_profiler.log("upsample complete")
+
+        if low_memory_stage2_video_only:
+            memory_profiler.start("stage 2 model trim")
+            console.print(
+                "[dim]Low-memory: stripping transformer audio/cross-modal modules before Stage 2[/]"
+            )
+            strip_transformer_to_video_only(transformer)
+            memory_profiler.log("stage 2 model trimmed")
 
         # Stage 2
         console.print(
             f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w*32}x{stage2_h*32} (3 steps)"
         )
+        if low_memory_stage2_video_only:
+            console.print(
+                "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
+            )
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and stage2_image_latent is not None:
+        if is_i2v:
+            memory_profiler.start("stage 2 conditioning")
+            with console.status(
+                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+            ):
+                s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                stage2_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s2_h,
+                    width=s2_w,
+                    dtype=model_dtype,
+                )
+            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
@@ -2248,6 +2504,8 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del stage2_image_latent
+            memory_profiler.log("stage 2 conditioning ready")
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
@@ -2255,8 +2513,10 @@ def generate_video(
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
 
+        memory_profiler.start("stage 2 denoise")
+
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
-        if audio_latents is not None and not is_a2v:
+        if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
             audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
             audio_noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             audio_latents = audio_noise * audio_noise_scale + audio_latents * (
@@ -2265,7 +2525,7 @@ def generate_video(
             mx.eval(audio_latents)
 
         # Joint video + audio refinement (no CFG, positive embeddings only)
-        latents, audio_latents = denoise_distilled(
+        latents, refined_audio_latents = denoise_distilled(
             latents,
             positions,
             text_embeddings,
@@ -2273,11 +2533,14 @@ def generate_video(
             STAGE_2_SIGMAS,
             verbose=verbose,
             state=state2,
-            audio_latents=audio_latents,
-            audio_positions=audio_positions,
-            audio_embeddings=audio_embeddings,
+            audio_latents=None if low_memory_stage2_video_only else audio_latents,
+            audio_positions=None if low_memory_stage2_video_only else audio_positions,
+            audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings,
             audio_frozen=is_a2v,
         )
+        if refined_audio_latents is not None:
+            audio_latents = refined_audio_latents
+        memory_profiler.log("stage 2 complete")
 
     elif pipeline == PipelineType.DEV:
         # ======================================================================
@@ -2317,6 +2580,7 @@ def generate_video(
         console.print(
             f"\n[bold yellow]⚡ Generating:[/] {width}x{height} ({num_inference_steps} steps, CFG={cfg_scale}, rescale={cfg_rescale})"
         )
+        memory_profiler.start("dev denoise")
         mx.random.seed(seed)
 
         video_positions = create_position_grid(1, latent_frames, latent_h, latent_w)
@@ -2389,6 +2653,7 @@ def generate_video(
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
         )
+        memory_profiler.log("dev complete")
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
         vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
@@ -2403,38 +2668,19 @@ def generate_video(
 
         # Load VAE encoder for I2V
         stage1_image_latent = None
-        stage2_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"
+                "[blue]🖼️  Encoding Stage 1 image conditioning...[/]", spinner="dots"
             ):
-                vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
-                )
-
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
-                input_image = load_image(
-                    image, height=s1_h, width=s1_w, dtype=model_dtype
+                stage1_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s1_h,
+                    width=s1_w,
+                    dtype=model_dtype,
                 )
-                stage1_image_tensor = prepare_image_for_encoding(
-                    input_image, s1_h, s1_w, dtype=model_dtype
-                )
-                stage1_image_latent = vae_encoder(stage1_image_tensor)
-                mx.eval(stage1_image_latent)
-
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                input_image = load_image(
-                    image, height=s2_h, width=s2_w, dtype=model_dtype
-                )
-                stage2_image_tensor = prepare_image_for_encoding(
-                    input_image, s2_h, s2_w, dtype=model_dtype
-                )
-                stage2_image_latent = vae_encoder(stage2_image_tensor)
-                mx.eval(stage2_image_latent)
-
-                del vae_encoder
-                mx.clear_cache()
-            console.print("[green]✓[/] VAE encoder loaded and image encoded")
+            console.print("[green]✓[/] Stage 1 image conditioning encoded")
 
         # Stage 1: Dev denoising at reduced resolution with CFG
         sigmas = ltx2_scheduler(steps=num_inference_steps)
@@ -2446,6 +2692,7 @@ def generate_video(
         console.print(
             f"\n[bold yellow]⚡ Stage 1:[/] Dev generating at {stage1_w*32}x{stage1_h*32} ({num_inference_steps} steps, CFG={cfg_scale}, rescale={cfg_rescale})"
         )
+        memory_profiler.start("stage 1 denoise")
         mx.random.seed(seed)
 
         positions = create_position_grid(1, latent_frames, stage1_h, stage1_w)
@@ -2523,7 +2770,15 @@ def generate_video(
 
         mx.eval(audio_latents)
 
+        if state1 is not None:
+            del state1
+        if stage1_image_latent is not None:
+            del stage1_image_latent
+        mx.clear_cache()
+        memory_profiler.log("stage 1 complete")
+
         # Upsample latents
+        memory_profiler.start("upsample")
         with console.status(
             f"[magenta]🔍 Upsampling latents {upscaler_scale}x...[/]", spinner="dots"
         ):
@@ -2532,19 +2787,20 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+            vae_mean, vae_std = load_video_decoder_statistics(model_path)
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                vae_mean,
+                vae_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, vae_mean, vae_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
+        memory_profiler.log("upsample complete")
 
         # Merge LoRA weights for stage 2 (distilled refinement)
         if lora_path is None:
@@ -2564,17 +2820,43 @@ def generate_video(
             ):
                 load_and_merge_lora(transformer, lora_path, strength=lora_strength)
 
+        if low_memory_stage2_video_only:
+            memory_profiler.start("stage 2 model trim")
+            console.print(
+                "[dim]Low-memory: stripping transformer audio/cross-modal modules before Stage 2[/]"
+            )
+            strip_transformer_to_video_only(transformer)
+            memory_profiler.log("stage 2 model trimmed")
+
         # Stage 2: Distilled refinement at full resolution (no CFG)
         # Matches PyTorch: re-noise audio at sigma=0.909375, then jointly refine
         # both video and audio through the distilled schedule using the LoRA-merged model.
         console.print(
             f"\n[bold yellow]⚡ Stage 2:[/] Distilled refining at {width}x{height} (3 steps, no CFG)"
         )
+        if low_memory_stage2_video_only:
+            console.print(
+                "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
+            )
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and stage2_image_latent is not None:
+        if is_i2v:
+            memory_profiler.start("stage 2 conditioning")
+            with console.status(
+                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+            ):
+                s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                stage2_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s2_h,
+                    width=s2_w,
+                    dtype=model_dtype,
+                )
+            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
@@ -2598,6 +2880,8 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del stage2_image_latent
+            memory_profiler.log("stage 2 conditioning ready")
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
@@ -2605,8 +2889,10 @@ def generate_video(
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
 
+        memory_profiler.start("stage 2 denoise")
+
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
-        if audio_latents is not None and not is_a2v:
+        if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
             audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
             audio_noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             audio_latents = audio_noise * audio_noise_scale + audio_latents * (
@@ -2615,7 +2901,7 @@ def generate_video(
             mx.eval(audio_latents)
 
         # Joint video + audio refinement (no CFG, positive embeddings only)
-        latents, audio_latents = denoise_distilled(
+        latents, refined_audio_latents = denoise_distilled(
             latents,
             positions,
             text_embeddings,
@@ -2623,11 +2909,14 @@ def generate_video(
             STAGE_2_SIGMAS,
             verbose=verbose,
             state=state2,
-            audio_latents=audio_latents,
-            audio_positions=audio_positions,
-            audio_embeddings=audio_embeddings_pos,
+            audio_latents=None if low_memory_stage2_video_only else audio_latents,
+            audio_positions=None if low_memory_stage2_video_only else audio_positions,
+            audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings_pos,
             audio_frozen=is_a2v,
         )
+        if refined_audio_latents is not None:
+            audio_latents = refined_audio_latents
+        memory_profiler.log("stage 2 complete")
 
     elif pipeline == PipelineType.DEV_TWO_STAGE_HQ:
         # ======================================================================
@@ -2656,38 +2945,19 @@ def generate_video(
 
         # Load VAE encoder for I2V
         stage1_image_latent = None
-        stage2_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]Loading VAE encoder and encoding image...[/]", spinner="dots"
+                "[blue]🖼️  Encoding Stage 1 image conditioning...[/]", spinner="dots"
             ):
-                vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
-                )
-
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
-                input_image = load_image(
-                    image, height=s1_h, width=s1_w, dtype=model_dtype
+                stage1_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s1_h,
+                    width=s1_w,
+                    dtype=model_dtype,
                 )
-                stage1_image_tensor = prepare_image_for_encoding(
-                    input_image, s1_h, s1_w, dtype=model_dtype
-                )
-                stage1_image_latent = vae_encoder(stage1_image_tensor)
-                mx.eval(stage1_image_latent)
-
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                input_image = load_image(
-                    image, height=s2_h, width=s2_w, dtype=model_dtype
-                )
-                stage2_image_tensor = prepare_image_for_encoding(
-                    input_image, s2_h, s2_w, dtype=model_dtype
-                )
-                stage2_image_latent = vae_encoder(stage2_image_tensor)
-                mx.eval(stage2_image_latent)
-
-                del vae_encoder
-                mx.clear_cache()
-            console.print("[green]✓[/] VAE encoder loaded and image encoded")
+            console.print("[green]✓[/] Stage 1 image conditioning encoded")
 
         # Auto-detect and merge LoRA for stage 1 (strength 0.25)
         if lora_path is None:
@@ -2721,6 +2991,7 @@ def generate_video(
         console.print(
             f"\n[bold yellow]Stage 1:[/] res_2s at {stage1_w*32}x{stage1_h*32} ({hq_steps} steps, CFG={cfg_scale}, rescale={hq_cfg_rescale})"
         )
+        memory_profiler.start("stage 1 denoise")
         mx.random.seed(seed)
 
         positions = create_position_grid(1, latent_frames, stage1_h, stage1_w)
@@ -2796,7 +3067,15 @@ def generate_video(
 
         mx.eval(audio_latents)
 
+        if state1 is not None:
+            del state1
+        if stage1_image_latent is not None:
+            del stage1_image_latent
+        mx.clear_cache()
+        memory_profiler.log("stage 1 complete")
+
         # Upsample latents
+        memory_profiler.start("upsample")
         with console.status(
             f"[magenta]Upsampling latents {upscaler_scale}x...[/]", spinner="dots"
         ):
@@ -2805,19 +3084,20 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+            vae_mean, vae_std = load_video_decoder_statistics(model_path)
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                vae_mean,
+                vae_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, vae_mean, vae_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
+        memory_profiler.log("upsample complete")
 
         # Merge additional LoRA for stage 2 (additive: 0.25 + 0.25 = 0.5 total)
         if lora_path is not None:
@@ -2839,7 +3119,21 @@ def generate_video(
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and stage2_image_latent is not None:
+        if is_i2v:
+            memory_profiler.start("stage 2 conditioning")
+            with console.status(
+                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+            ):
+                s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                stage2_image_latent = encode_conditioning_image_latent(
+                    model_path=model_path,
+                    image_path=image,
+                    height=s2_h,
+                    width=s2_w,
+                    dtype=model_dtype,
+                )
+            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
@@ -2863,12 +3157,16 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del stage2_image_latent
+            memory_profiler.log("stage 2 conditioning ready")
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+
+        memory_profiler.start("stage 2 denoise")
 
         # Re-noise audio at sigma=0.909375 for joint refinement
         if audio_latents is not None and not is_a2v:
@@ -2900,15 +3198,20 @@ def generate_video(
             noise_seed=seed + 1,
             audio_frozen=is_a2v,
         )
+        memory_profiler.log("stage 2 complete")
 
     del transformer
     mx.clear_cache()
+
+    if pipeline != PipelineType.DEV:
+        vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
 
     # ==========================================================================
     # Decode and save outputs (common to both pipelines)
     # ==========================================================================
 
     console.print("\n[blue]🎞️  Decoding video...[/]")
+    memory_profiler.start("video decode")
 
     # Select tiling configuration
     if tiling == "none":
@@ -2993,6 +3296,7 @@ def generate_video(
         video = vae_decoder(latents)
     mx.eval(video)
     mx.clear_cache()
+    memory_profiler.log("video decoded")
 
     # Close stream writer
     if video_writer is not None:
@@ -3044,6 +3348,7 @@ def generate_video(
             vocoder_sample_rate = a2v_sr or AUDIO_LATENT_SAMPLE_RATE
             console.print("[green]✓[/] Using original input audio (A2V)")
         else:
+            memory_profiler.start("audio decode")
             with console.status("[blue]Decoding audio...[/]", spinner="dots"):
                 audio_decoder = load_audio_decoder(model_path, pipeline)
                 vocoder = load_vocoder_model(model_path, pipeline)
@@ -3070,6 +3375,7 @@ def generate_video(
                 del audio_decoder, vocoder
                 mx.clear_cache()
             console.print("[green]✓[/] Audio decoded")
+            memory_profiler.log("audio decoded")
 
         audio_path = (
             Path(output_audio_path)
@@ -3105,7 +3411,7 @@ def generate_video(
     console.print(
         Panel(
             f"[bold green]🎉 Done![/] Generated in {time_str} ({elapsed/num_frames:.2f}s/frame)\n"
-            f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024 ** 3):.2f}GB",
+            f"[bold green]✨ Peak memory:[/] {memory_profiler.final_peak() / (1024 ** 3):.2f}GB",
             expand=False,
         )
     )
@@ -3271,6 +3577,16 @@ Examples:
         help="Stream frames to output as they're decoded",
     )
     parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Apply safer low-memory settings (conservative tiling, reduced extra guidance passes)",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Print phase-local MLX memory measurements for profiling/debugging",
+    )
+    parser.add_argument(
         "--audio",
         "-a",
         action="store_true",
@@ -3408,6 +3724,8 @@ Examples:
         audio_file=args.audio_file,
         audio_start_time=args.audio_start_time,
         spatial_upscaler=args.spatial_upscaler,
+        low_memory=args.low_memory,
+        profile_memory=args.profile_memory,
     )
 
 

@@ -10,12 +10,32 @@ from mlx_video.models.ltx_2.config import LTXRopeType
 from mlx_video.models.ltx_2.rope import apply_rotary_emb
 
 
+def _slice_rope_freqs(
+    freqs_cis: Optional[Tuple[mx.array, mx.array]],
+    start: int,
+    end: int,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    """Slice RoPE frequencies along the sequence dimension for query chunking."""
+    if freqs_cis is None:
+        return None
+
+    cos_freqs, sin_freqs = freqs_cis
+
+    if cos_freqs.ndim == 3:
+        return cos_freqs[:, start:end, :], sin_freqs[:, start:end, :]
+    if cos_freqs.ndim == 4:
+        return cos_freqs[:, :, start:end, :], sin_freqs[:, :, start:end, :]
+
+    raise ValueError(f"Unsupported RoPE tensor rank for chunk slicing: {cos_freqs.ndim}")
+
+
 def scaled_dot_product_attention(
     q: mx.array,
     k: mx.array,
     v: mx.array,
     heads: int,
     mask: Optional[mx.array] = None,
+    query_chunk_size: Optional[int] = None,
 ) -> mx.array:
 
     b, q_seq_len, dim = q.shape
@@ -44,7 +64,24 @@ def scaled_dot_product_attention(
     # Compute scaled dot-product attention
     scale = 1.0 / math.sqrt(dim_head)
 
-    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    if query_chunk_size is not None and query_chunk_size > 0 and q_seq_len > query_chunk_size:
+        outputs = []
+        for start in range(0, q_seq_len, query_chunk_size):
+            end = min(start + query_chunk_size, q_seq_len)
+            q_chunk = q[:, :, start:end, :]
+
+            mask_chunk = mask
+            if mask is not None and mask.ndim >= 4 and mask.shape[-2] == q_seq_len:
+                mask_chunk = mask[..., start:end, :]
+
+            out_chunk = mx.fast.scaled_dot_product_attention(
+                q_chunk, k, v, scale=scale, mask=mask_chunk
+            )
+            outputs.append(out_chunk)
+
+        out = mx.concatenate(outputs, axis=2)
+    else:
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
     # Reshape back to (B, q_seq_len, heads * dim_head)
     out = mx.swapaxes(out, 1, 2)
@@ -74,6 +111,7 @@ class Attention(nn.Module):
         self.rope_type = rope_type
         self.heads = heads
         self.dim_head = dim_head
+        self.query_chunk_size: Optional[int] = None
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
@@ -117,18 +155,77 @@ class Attention(nn.Module):
         Returns:
             Attention output of shape (B, seq_len, query_dim)
         """
-        # Compute per-head gate early (from original input)
-        gate = None
-        if hasattr(self, "to_gate_logits"):
-            gate = 2.0 * mx.sigmoid(self.to_gate_logits(x))  # (B, seq, heads)
-
         context = x if context is None else context
         v = self.to_v(context)
 
         if skip_attention:
+            gate = None
+            if hasattr(self, "to_gate_logits"):
+                gate = 2.0 * mx.sigmoid(self.to_gate_logits(x))  # (B, seq, heads)
             # STG: bypass Q*K*V attention, use value projection only
             out = v
+            if gate is not None:
+                b, seq_len, _ = out.shape
+                out = mx.reshape(out, (b, seq_len, self.heads, self.dim_head))
+                out = out * gate[..., None]
+                out = mx.reshape(out, (b, seq_len, -1))
+            return self.to_out(out)
+        elif (
+            self.query_chunk_size is not None
+            and self.query_chunk_size > 0
+            and x.shape[1] > self.query_chunk_size
+        ):
+            k = self.to_k(context)
+            k = self.k_norm(k)
+
+            if pe is not None:
+                k_pe_to_use = pe if k_pe is None else k_pe
+                k = apply_rotary_emb(k, k_pe_to_use, self.rope_type)
+
+            out_chunks = []
+            for start in range(0, x.shape[1], self.query_chunk_size):
+                end = min(start + self.query_chunk_size, x.shape[1])
+                x_chunk = x[:, start:end, :]
+                q_chunk = self.to_q(x_chunk)
+                q_chunk = self.q_norm(q_chunk)
+
+                if pe is not None:
+                    q_chunk = apply_rotary_emb(
+                        q_chunk,
+                        _slice_rope_freqs(pe, start, end),
+                        self.rope_type,
+                    )
+
+                mask_chunk = mask
+                if mask is not None and mask.ndim >= 4 and mask.shape[-2] == x.shape[1]:
+                    mask_chunk = mask[..., start:end, :]
+
+                out_chunk = scaled_dot_product_attention(
+                    q_chunk,
+                    k,
+                    v,
+                    self.heads,
+                    mask_chunk,
+                )
+
+                if hasattr(self, "to_gate_logits"):
+                    gate_chunk = 2.0 * mx.sigmoid(self.to_gate_logits(x_chunk))
+                    b, seq_len, _ = out_chunk.shape
+                    out_chunk = mx.reshape(
+                        out_chunk, (b, seq_len, self.heads, self.dim_head)
+                    )
+                    out_chunk = out_chunk * gate_chunk[..., None]
+                    out_chunk = mx.reshape(out_chunk, (b, seq_len, -1))
+
+                out_chunks.append(self.to_out(out_chunk))
+
+            return mx.concatenate(out_chunks, axis=1)
         else:
+            # Compute per-head gate early (from original input)
+            gate = None
+            if hasattr(self, "to_gate_logits"):
+                gate = 2.0 * mx.sigmoid(self.to_gate_logits(x))  # (B, seq, heads)
+
             # Standard attention
             q = self.to_q(x)
             k = self.to_k(context)
@@ -141,14 +238,21 @@ class Attention(nn.Module):
                 k_pe_to_use = pe if k_pe is None else k_pe
                 k = apply_rotary_emb(k, k_pe_to_use, self.rope_type)
 
-            out = scaled_dot_product_attention(q, k, v, self.heads, mask)
+            out = scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                self.heads,
+                mask,
+                query_chunk_size=self.query_chunk_size,
+            )
 
-        # Apply per-head gating
-        if gate is not None:
-            b, seq_len, _ = out.shape
-            out = mx.reshape(out, (b, seq_len, self.heads, self.dim_head))
-            out = out * gate[..., None]
-            out = mx.reshape(out, (b, seq_len, -1))
+            # Apply per-head gating
+            if gate is not None:
+                b, seq_len, _ = out.shape
+                out = mx.reshape(out, (b, seq_len, self.heads, self.dim_head))
+                out = out * gate[..., None]
+                out = mx.reshape(out, (b, seq_len, -1))
 
-        # Project output
-        return self.to_out(out)
+            # Project output
+            return self.to_out(out)

@@ -57,6 +57,8 @@ def generate_video_dev(
     audio_file: Optional[str] = None,
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
+    low_memory: bool = False,
+    profile_memory: bool = False,
 ):
     """Compatibility wrapper for the historical dev-only API.
 
@@ -106,6 +108,8 @@ def generate_video_dev(
         audio_file=audio_file,
         audio_start_time=audio_start_time,
         spatial_upscaler=spatial_upscaler,
+        low_memory=low_memory,
+        profile_memory=profile_memory,
     )
 
 
