@@ -122,29 +122,50 @@ def apply_conditioning(
         num_cond_frames = cond_f
         end_idx = min(frame_idx + num_cond_frames, f)
 
-        # Replace latent at conditioning position
-        # state.latent[:, :, frame_idx:end_idx] = cond_latent[:, :, :end_idx - frame_idx]
-        latent_list = []
-        clean_list = []
-        mask_list = []
+        # Replace only the affected span instead of concatenating one frame at a time.
+        # This keeps temporary tensors bounded to prefix / conditioned span / suffix,
+        # which materially lowers peak memory for long videos at Stage 2.
+        replacement = cond_latent[:, :, : end_idx - frame_idx]
 
-        for i in range(f):
-            if frame_idx <= i < end_idx:
-                # Use conditioning latent
-                cond_idx = i - frame_idx
-                latent_list.append(cond_latent[:, :, cond_idx : cond_idx + 1])
-                clean_list.append(cond_latent[:, :, cond_idx : cond_idx + 1])
-                # Set mask: 1.0 - strength means less denoising for conditioned frames
-                mask_list.append(mx.full((b, 1, 1, 1, 1), 1.0 - strength, dtype=dtype))
-            else:
-                # Keep original
-                latent_list.append(state.latent[:, :, i : i + 1])
-                clean_list.append(state.clean_latent[:, :, i : i + 1])
-                mask_list.append(state.denoise_mask[:, :, i : i + 1])
+        latent_segments = []
+        clean_segments = []
+        mask_segments = []
 
-        state.latent = mx.concatenate(latent_list, axis=2)
-        state.clean_latent = mx.concatenate(clean_list, axis=2)
-        state.denoise_mask = mx.concatenate(mask_list, axis=2)
+        if frame_idx > 0:
+            latent_segments.append(state.latent[:, :, :frame_idx])
+            clean_segments.append(state.clean_latent[:, :, :frame_idx])
+            mask_segments.append(state.denoise_mask[:, :, :frame_idx])
+
+        latent_segments.append(replacement)
+        clean_segments.append(replacement)
+        mask_segments.append(
+            mx.full(
+                (b, 1, end_idx - frame_idx, 1, 1),
+                1.0 - strength,
+                dtype=dtype,
+            )
+        )
+
+        if end_idx < f:
+            latent_segments.append(state.latent[:, :, end_idx:])
+            clean_segments.append(state.clean_latent[:, :, end_idx:])
+            mask_segments.append(state.denoise_mask[:, :, end_idx:])
+
+        state.latent = (
+            latent_segments[0]
+            if len(latent_segments) == 1
+            else mx.concatenate(latent_segments, axis=2)
+        )
+        state.clean_latent = (
+            clean_segments[0]
+            if len(clean_segments) == 1
+            else mx.concatenate(clean_segments, axis=2)
+        )
+        state.denoise_mask = (
+            mask_segments[0]
+            if len(mask_segments) == 1
+            else mx.concatenate(mask_segments, axis=2)
+        )
 
     return state
 
