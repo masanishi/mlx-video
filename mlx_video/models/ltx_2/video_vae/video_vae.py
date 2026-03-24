@@ -222,6 +222,146 @@ def _make_decoder_block(
     return block, out_channels
 
 
+def infer_encoder_blocks_from_weights(
+    weights: Dict[str, mx.array],
+) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
+    """Infer the Video VAE encoder block layout from sanitized weights.
+
+    Some converted model repos ship an encoder `config.json` whose `encoder_blocks`
+    do not exactly match the saved weights. Inferring the block structure directly
+    from weights lets loading recover from those stale configs.
+
+    Args:
+        weights: Flat, sanitized encoder weights keyed like `down_blocks.5...`.
+
+    Returns:
+        Inferred encoder block definitions, or None if the structure could not be
+        determined.
+    """
+    block_indices = set()
+    for key in weights:
+        if not key.startswith("down_blocks."):
+            continue
+        parts = key.split(".")
+        if len(parts) > 1 and parts[1].isdigit():
+            block_indices.add(int(parts[1]))
+
+    if not block_indices:
+        return None
+
+    conv_out_weight = weights.get("conv_out.conv.weight")
+    conv_out_in_channels = None
+    if conv_out_weight is not None and conv_out_weight.ndim == 5:
+        conv_out_in_channels = conv_out_weight.shape[-1]
+
+    raw_blocks = []
+    for idx in sorted(block_indices):
+        prefix = f"down_blocks.{idx}."
+        res_indices = set()
+        res_channels = None
+        conv_key = None
+        conv_weight = None
+
+        for key, value in weights.items():
+            if not key.startswith(prefix):
+                continue
+
+            suffix = key[len(prefix) :]
+            if suffix.startswith("res_blocks."):
+                parts = suffix.split(".")
+                if len(parts) > 1 and parts[1].isdigit():
+                    res_indices.add(int(parts[1]))
+                if suffix == "res_blocks.0.conv1.conv.weight" and value.ndim == 5:
+                    res_channels = value.shape[0]
+            elif suffix in {"conv.conv.weight", "conv.weight"} and value.ndim == 5:
+                conv_key = suffix
+                conv_weight = value
+
+        if res_indices:
+            if res_channels is None:
+                return None
+            raw_blocks.append(
+                {
+                    "kind": "res",
+                    "channels": res_channels,
+                    "num_layers": max(res_indices) + 1,
+                }
+            )
+        elif conv_weight is not None:
+            raw_blocks.append(
+                {
+                    "kind": "downsample",
+                    "in_channels": conv_weight.shape[-1],
+                    "conv_out_channels": conv_weight.shape[0],
+                    "residual": conv_key == "conv.conv.weight",
+                }
+            )
+        else:
+            return None
+
+    inferred_blocks = []
+    for idx, block in enumerate(raw_blocks):
+        if block["kind"] == "res":
+            inferred_blocks.append(("res_x", {"num_layers": block["num_layers"]}))
+            continue
+
+        next_channels = None
+        for next_block in raw_blocks[idx + 1 :]:
+            if next_block["kind"] == "res":
+                next_channels = next_block["channels"]
+            else:
+                next_channels = next_block["in_channels"]
+            break
+
+        if next_channels is None:
+            next_channels = conv_out_in_channels or block["in_channels"]
+
+        in_channels = block["in_channels"]
+        conv_out_channels = block["conv_out_channels"]
+        if (
+            in_channels <= 0
+            or conv_out_channels <= 0
+            or next_channels <= 0
+            or next_channels % in_channels != 0
+            or next_channels % conv_out_channels != 0
+        ):
+            return None
+
+        channel_multiplier = next_channels // in_channels
+        stride_multiplier = next_channels // conv_out_channels
+
+        if block["residual"]:
+            block_name = {
+                2: "compress_time_res",
+                4: "compress_space_res",
+                8: "compress_all_res",
+            }.get(stride_multiplier)
+            if block_name is None:
+                return None
+            inferred_blocks.append((block_name, {"multiplier": channel_multiplier}))
+            continue
+
+        if stride_multiplier == 2:
+            if channel_multiplier != 1:
+                return None
+            inferred_blocks.append(("compress_time", {}))
+        elif stride_multiplier == 4:
+            if channel_multiplier != 1:
+                return None
+            inferred_blocks.append(("compress_space", {}))
+        elif stride_multiplier == 8:
+            if channel_multiplier == 1:
+                inferred_blocks.append(("compress_all", {}))
+            else:
+                inferred_blocks.append(
+                    ("compress_all_x_y", {"multiplier": channel_multiplier})
+                )
+        else:
+            return None
+
+    return inferred_blocks
+
+
 class VideoEncoder(nn.Module):
 
     _DEFAULT_NORM_NUM_GROUPS = 32
@@ -373,7 +513,8 @@ class VideoEncoder(nn.Module):
         means = sample[:, : self.latent_channels, ...]
         return self.per_channel_statistics.normalize(means)
 
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    @staticmethod
+    def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Sanitize VAE encoder weights from PyTorch format to MLX format."""
         sanitized = {}
         if "per_channel_statistics.mean" in weights:
@@ -448,9 +589,16 @@ class VideoEncoder(nn.Module):
             for wf in weight_files:
                 weights.update(mx.load(str(wf)))
 
-        # Create model, sanitize and load weights
+        # Sanitize weights first so we can reconcile stale configs against the
+        # actual saved parameter shapes.
+        weights = cls.sanitize(weights)
+
+        inferred_blocks = infer_encoder_blocks_from_weights(weights)
+        if inferred_blocks is not None:
+            config.encoder_blocks = inferred_blocks
+
+        # Create model and load weights
         model = cls(config)
-        weights = model.sanitize(weights)
         model.load_weights(list(weights.items()), strict=False)
         return model
 

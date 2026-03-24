@@ -1,4 +1,4 @@
-"""Unified video and audio-video generation pipeline for LTX-2.
+"""Unified video and audio-video generation pipeline for LTX-2 / LTX-2.3.
 
 Supports both distilled (two-stage with upsampling) and dev (single-stage with CFG) pipelines.
 """
@@ -75,6 +75,11 @@ AUDIO_MEL_BINS = 16
 AUDIO_LATENTS_PER_SECOND = (
     AUDIO_LATENT_SAMPLE_RATE / AUDIO_HOP_LENGTH / AUDIO_LATENT_DOWNSAMPLE_FACTOR
 )  # 25
+
+# Default external text encoder repo for reformatted model repos without
+# embedded Gemma weights (e.g. LTX-2.3 pre-converted checkpoints).
+DEFAULT_TEXT_ENCODER_REPO = "google/gemma-3-12b-it"
+TEXT_ENCODER_ALLOW_PATTERNS = ["*.safetensors", "*.json", "*.model"]
 
 # Default negative prompt for CFG (dev pipeline)
 # Matches PyTorch LTX-2 reference DEFAULT_NEGATIVE_PROMPT from constants.py
@@ -1673,9 +1678,43 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
 # =============================================================================
 
 
+def resolve_text_encoder_path(
+    model_path: Path,
+    text_encoder_repo: Optional[str],
+) -> Path:
+    """Resolve the text encoder path for LTX generation.
+
+    Monolithic/original model repos include the text encoder at the repo root.
+    Reformatted repos such as LTX-2.3 distilled/dev ship transformer + connector
+    weights separately and require a standalone Gemma repo.
+    """
+    if text_encoder_repo is not None:
+        return get_model_path(
+            text_encoder_repo,
+            allow_patterns=TEXT_ENCODER_ALLOW_PATTERNS,
+            required_patterns=["*.safetensors", "tokenizer.json"],
+        )
+
+    has_embedded_text_encoder = (model_path / "config.json").exists() or (
+        model_path / "text_encoder"
+    ).is_dir()
+    if has_embedded_text_encoder:
+        return model_path
+
+    console.print(
+        "[dim]No embedded text encoder found; "
+        f"using {DEFAULT_TEXT_ENCODER_REPO}[/]"
+    )
+    return get_model_path(
+        DEFAULT_TEXT_ENCODER_REPO,
+        allow_patterns=TEXT_ENCODER_ALLOW_PATTERNS,
+        required_patterns=["*.safetensors", "tokenizer.json"],
+    )
+
+
 def generate_video(
     model_repo: str,
-    text_encoder_repo: str,
+    text_encoder_repo: Optional[str],
     prompt: str,
     pipeline: PipelineType = PipelineType.DISTILLED,
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
@@ -1715,7 +1754,7 @@ def generate_video(
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
 ):
-    """Generate video using LTX-2 models.
+    """Generate video using LTX-2 / LTX-2.3 models.
 
     Supports four pipelines:
     - DISTILLED: Two-stage generation with upsampling, fixed sigma schedules, no CFG
@@ -1725,7 +1764,7 @@ def generate_video(
 
     Args:
         model_repo: Model repository ID
-        text_encoder_repo: Text encoder repository ID
+        text_encoder_repo: Optional separate text encoder repository ID
         prompt: Text description of the video to generate
         pipeline: Pipeline type (DISTILLED or DEV)
         negative_prompt: Negative prompt for CFG (dev pipeline only)
@@ -1826,8 +1865,9 @@ def generate_video(
 
     # Get model path
     model_path = get_model_path(model_repo)
-    text_encoder_path = (
-        model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
+    text_encoder_path = resolve_text_encoder_path(
+        model_path=model_path,
+        text_encoder_repo=text_encoder_repo,
     )
 
     # Resolve spatial upscaler path for two-stage pipelines
@@ -1850,12 +1890,12 @@ def generate_video(
             elif "x2" in str(upscaler_path):
                 upscaler_scale = 2.0
         else:
-            # Auto-detect: prefer x2 upscaler
+            # Auto-detect: prefer the newest x2 upscaler variant
             upscaler_files = sorted(
                 model_path.glob("*spatial-upscaler-x2*.safetensors")
             )
             if upscaler_files:
-                upscaler_path = upscaler_files[0]
+                upscaler_path = upscaler_files[-1]
                 upscaler_scale = 2.0
 
     # Calculate latent dimensions
@@ -2077,6 +2117,15 @@ def generate_video(
                 mx.clear_cache()
             console.print("[green]✓[/] VAE encoder loaded and image encoded")
 
+        # Merge distilled LoRA before stage 1 so it affects the full distilled
+        # pipeline (stage 1 generation + stage 2 refinement) with a single merge.
+        if lora_path is not None:
+            with console.status(
+                f"[blue]🔧 Merging distilled LoRA (stages 1+2, strength={lora_strength})...[/]",
+                spinner="dots",
+            ):
+                load_and_merge_lora(transformer, lora_path, strength=lora_strength)
+
         # Stage 1
         console.print(
             f"\n[bold yellow]⚡ Stage 1:[/] Generating at {stage1_w*32}x{stage1_h*32} (8 steps)"
@@ -2153,9 +2202,7 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
-            )
+            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
 
             latents = upsample_latents(
                 latents,
@@ -2485,9 +2532,7 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
-            )
+            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
 
             latents = upsample_latents(
                 latents,
@@ -2760,9 +2805,7 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
-            )
+            vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
 
             latents = upsample_latents(
                 latents,
@@ -3074,28 +3117,31 @@ def generate_video(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate videos with MLX LTX-2 (Distilled or Dev pipeline)",
+                description="Generate LTX-2 / LTX-2.3 videos with optional I2V, A2V, and synchronized audio",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Distilled pipeline (two-stage, fast, no CFG)
-  python -m mlx_video.generate --prompt "A cat walking on grass"
-  python -m mlx_video.generate --prompt "Ocean waves" --pipeline distilled
+    uv run mlx_video.ltx_2.generate --prompt "A cat walking on grass"
+    uv run mlx_video.ltx_2.generate --prompt "Ocean waves" --pipeline distilled
 
   # Dev pipeline (single-stage, CFG, higher quality)
-  python -m mlx_video.generate --prompt "A cat walking" --pipeline dev --cfg-scale 3.0
-  python -m mlx_video.generate --prompt "Ocean waves" --pipeline dev --steps 40
+    uv run mlx_video.ltx_2.generate --prompt "A cat walking" --pipeline dev --cfg-scale 3.0
+    uv run mlx_video.ltx_2.generate --prompt "Ocean waves" --pipeline dev --steps 40
 
   # Dev two-stage pipeline (dev + LoRA refinement)
-  python -m mlx_video.generate --prompt "A cat walking" --pipeline dev-two-stage --cfg-scale 3.0
+    uv run mlx_video.ltx_2.generate --prompt "A cat walking" --pipeline dev-two-stage --cfg-scale 3.0
 
   # Image-to-Video (works with both pipelines)
-  python -m mlx_video.generate --prompt "A person dancing" --image photo.jpg
-  python -m mlx_video.generate --prompt "Waves crashing" --image beach.png --pipeline dev
+    uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg
+    uv run mlx_video.ltx_2.generate --prompt "Waves crashing" --image beach.png --pipeline dev
+
+    # Image-to-Video + synchronized audio generation
+    uv run mlx_video.ltx_2.generate --prompt "A singer on stage" --image singer.png --audio
 
   # With Audio (works with both pipelines)
-  python -m mlx_video.generate --prompt "Ocean waves crashing" --audio
-  python -m mlx_video.generate --prompt "A jazz band playing" --audio --pipeline dev
+    uv run mlx_video.ltx_2.generate --prompt "Ocean waves crashing" --audio
+    uv run mlx_video.ltx_2.generate --prompt "A jazz band playing" --audio --pipeline dev
         """,
     )
 
@@ -3161,10 +3207,16 @@ Examples:
         "--save-frames", action="store_true", help="Save individual frames as images"
     )
     parser.add_argument(
-        "--model-repo", type=str, default="Lightricks/LTX-2", help="Model repository"
+        "--model-repo",
+        type=str,
+        default="prince-canuma/LTX-2.3-distilled",
+        help="Model repository",
     )
     parser.add_argument(
-        "--text-encoder-repo", type=str, default=None, help="Text encoder repository"
+        "--text-encoder-repo",
+        type=str,
+        default=None,
+        help="Text encoder repository (auto-detects google/gemma-3-12b-it if needed)",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
@@ -3184,7 +3236,7 @@ Examples:
         "-i",
         type=str,
         default=None,
-        help="Path to conditioning image for I2V",
+        help="Path to conditioning image for I2V / I2V+Audio",
     )
     parser.add_argument(
         "--image-strength",
@@ -3222,13 +3274,13 @@ Examples:
         "--audio",
         "-a",
         action="store_true",
-        help="Enable synchronized audio generation",
+        help="Enable synchronized audio generation (can be combined with --image)",
     )
     parser.add_argument(
         "--audio-file",
         type=str,
         default=None,
-        help="Path to audio file for A2V (audio-to-video) conditioning",
+        help="Path to audio file for A2V (audio-to-video) conditioning; mutually exclusive with --audio",
     )
     parser.add_argument(
         "--audio-start-time",
@@ -3279,13 +3331,13 @@ Examples:
         "--lora-path",
         type=str,
         default=None,
-        help="Path to LoRA safetensors file (dev-two-stage pipeline)",
+        help="Path to LoRA safetensors file (distilled / dev-two-stage / dev-two-stage-hq)",
     )
     parser.add_argument(
         "--lora-strength",
         type=float,
         default=1.0,
-        help="LoRA merge strength (dev-two-stage pipeline, default 1.0)",
+        help="LoRA merge strength (distilled / dev-two-stage pipeline, default 1.0)",
     )
     parser.add_argument(
         "--lora-strength-stage-1",
@@ -3303,8 +3355,7 @@ Examples:
         "--spatial-upscaler",
         type=str,
         default=None,
-        help="Spatial upscaler filename (e.g. ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors). "
-        "Auto-detects x2 by default. Use this to select x1.5 or a specific version.",
+        help="Spatial upscaler filename (e.g. ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors). Auto-detects the latest x2 variant by default (prefers v1.1 over v1.0).",
     )
     args = parser.parse_args()
 

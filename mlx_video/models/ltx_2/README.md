@@ -1,4 +1,4 @@
-# LTX-2 for MLX
+# LTX-2 / LTX-2.3 for MLX
 
 MLX port of [LTX-2](https://huggingface.co/Lightricks/LTX-2), a 19B parameter video generation model from Lightricks with synchronized audio-video support.
 
@@ -19,13 +19,13 @@ Four pipeline types are available via the `--pipeline` flag:
 
 ```bash
 # Distilled (default) - fast, two-stage
-uv run mlx_video.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
+uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
 
 # Dev - single-stage with CFG
-uv run mlx_video.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
+uv run mlx_video.ltx_2.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
 
 # Dev two-stage - dev + LoRA refinement
-uv run mlx_video.generate --pipeline dev-two-stage \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage \
     --prompt "Two dogs of the poodle breed wearing sunglasses, close up, cinematic, sunset" \
     -n 145 --width 1024 --height 768 \
     --model-repo prince-canuma/LTX-2-dev \
@@ -33,12 +33,12 @@ uv run mlx_video.generate --pipeline dev-two-stage \
     --enhance-prompt
 
 # Dev two-stage HQ - res_2s sampler, LoRA both stages (highest quality)
-uv run mlx_video.generate --pipeline dev-two-stage-hq \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
     --prompt "A cinematic scene of ocean waves at golden hour" \
     --model-repo prince-canuma/LTX-2-dev
 
 # HQ with custom LoRA strengths
-uv run mlx_video.generate --pipeline dev-two-stage-hq \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
     --prompt "A sunset over mountains" \
     --model-repo prince-canuma/LTX-2-dev \
     --lora-strength-stage-1 0.3 --lora-strength-stage-2 0.6
@@ -48,10 +48,13 @@ uv run mlx_video.generate --pipeline dev-two-stage-hq \
 
 ```bash
 # Distilled I2V
-uv run mlx_video.generate --prompt "A person dancing" --image photo.jpg
+uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg
 
 # Dev I2V
-uv run mlx_video.generate --pipeline dev --prompt "Waves crashing" --image beach.png --cfg-scale 3.5
+uv run mlx_video.ltx_2.generate --pipeline dev --prompt "Waves crashing" --image beach.png --cfg-scale 3.5
+
+# I2V + synchronized audio generation
+uv run mlx_video.ltx_2.generate --prompt "A singer on stage" --image singer.png --audio
 ```
 
 ### Audio-to-Video (A2V)
@@ -60,59 +63,69 @@ Generate video conditioned on an input audio file. Works with all four pipelines
 
 ```bash
 # A2V - distilled (default, fastest)
-uv run mlx_video.generate --audio-file music.wav --prompt "A band playing music"
+uv run mlx_video.ltx_2.generate --audio-file music.wav --prompt "A band playing music"
 
 # A2V - dev (single-stage with CFG)
-uv run mlx_video.generate --pipeline dev --audio-file ocean.wav --prompt "Ocean waves"
+uv run mlx_video.ltx_2.generate --pipeline dev --audio-file ocean.wav --prompt "Ocean waves"
 
 # A2V - dev-two-stage (dev + LoRA refinement)
-uv run mlx_video.generate --pipeline dev-two-stage --audio-file music.wav \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage --audio-file music.wav \
     --prompt "A band playing music" --model-repo prince-canuma/LTX-2-dev
 
 # A2V - dev-two-stage-hq (highest quality)
-uv run mlx_video.generate --pipeline dev-two-stage-hq --audio-file music.wav \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq --audio-file music.wav \
     --prompt "A band playing music" --model-repo prince-canuma/LTX-2-dev
 
 # A2V + I2V (audio + image conditioning)
-uv run mlx_video.generate --audio-file rain.wav --image forest.jpg --prompt "Rain in forest"
+uv run mlx_video.ltx_2.generate --audio-file rain.wav --image forest.jpg --prompt "Rain in forest"
 
 # A2V with custom start time
-uv run mlx_video.generate --audio-file song.mp3 --audio-start-time 30.0 --prompt "Concert"
+uv run mlx_video.ltx_2.generate --audio-file song.mp3 --audio-start-time 30.0 --prompt "Concert"
 ```
 
-> **Note:** `--audio-file` (A2V) and `--audio` (generate audio) are mutually exclusive. Supported formats: WAV, FLAC, MP3, OGG, and video files with audio tracks.
+> **Note:** `--audio-file` (A2V) and `--audio` (generate audio) are mutually exclusive, but either one can be combined with `--image` for image-conditioned video. Supported formats: WAV, FLAC, MP3, OGG, and video files with audio tracks.
 
 ### Audio-Video Generation (experimental)
 
 Generate synchronized audio alongside video from scratch:
 
 ```bash
-uv run mlx_video.generate --prompt "Ocean waves crashing" --audio
-uv run mlx_video.generate --pipeline dev --prompt "A jazz band playing" --audio --enhance-prompt
+uv run mlx_video.ltx_2.generate --prompt "Ocean waves crashing" --audio
+uv run mlx_video.ltx_2.generate --pipeline dev --prompt "A jazz band playing" --audio --enhance-prompt
+
+# I2V + synchronized audio generation
+uv run mlx_video.ltx_2.generate --pipeline dev --prompt "A singer on stage" --image singer.png --audio
 
 # With full guidance (STG + modality_scale, matches PyTorch defaults)
-uv run mlx_video.generate --pipeline dev --prompt "Ocean waves crashing" --audio \
+uv run mlx_video.ltx_2.generate --pipeline dev --prompt "Ocean waves crashing" --audio \
     --stg-scale 1.0 --stg-blocks 29 --modality-scale 3.0
 ```
 
 ### LoRA
 
-LoRA weights can be loaded from a file, directory, or HuggingFace repo:
+LoRA weights can be loaded from a file, directory, or HuggingFace repo.
+
+For `distilled`, LoRA is applied during the stage 2 refinement pass when `--lora-path` is provided. For `dev-two-stage`, LoRA is applied during stage 2, and `dev-two-stage-hq` applies it in both stages:
 
 ```bash
+# Distilled with explicit LoRA
+uv run mlx_video.ltx_2.generate --prompt "A scene" \
+    --lora-path ./my-lora/weights.safetensors \
+    --lora-strength 1.0
+
 # From HuggingFace repo
-uv run mlx_video.generate --pipeline dev-two-stage \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage \
     --prompt "Camera dolly out of a forest" \
     --lora-path Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out \
     --lora-strength 1.0
 
 # From local file
-uv run mlx_video.generate --pipeline dev-two-stage \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage \
     --prompt "A scene" \
     --lora-path ./my-lora/weights.safetensors
 
 # From local directory (auto-detects .safetensors file)
-uv run mlx_video.generate --pipeline dev-two-stage \
+uv run mlx_video.ltx_2.generate --pipeline dev-two-stage \
     --prompt "A scene" \
     --lora-path ./LTX-2-distilled/lora
 ```
@@ -144,8 +157,8 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--seed`, `-s` | 42 | Random seed for reproducibility |
 | `--fps` | 24 | Frames per second |
 | `--output-path`, `-o` | output.mp4 | Output video path |
-| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
-| `--text-encoder-repo` | None | Separate text encoder repo (if not in model repo) |
+| `--model-repo` | prince-canuma/LTX-2.3-distilled | HuggingFace model repository |
+| `--text-encoder-repo` | None | Separate text encoder repo; auto-resolves `google/gemma-3-12b-it` if not in model repo |
 | `--save-frames` | false | Save individual frames as images |
 | `--enhance-prompt` | false | Enhance prompt using Gemma |
 | `--image`, `-i` | None | Conditioning image for I2V |
@@ -155,7 +168,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--audio-start-time` | 0.0 | Start time in seconds for audio file |
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `aggressive`, `conservative` |
 | `--stream` | false | Stream frames as they decode |
-| `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below) |
+| `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below). Auto-detects x2 by default. |
 
 ### Spatial Upscalers (LTX-2.3)
 
@@ -163,21 +176,22 @@ LTX-2.3 ships with multiple spatial upscaler variants. Use `--spatial-upscaler` 
 
 | Variant | Scale | Output (from 256x256) | Architecture |
 |---------|-------|-----------------------|--------------|
-| `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` (default) | 2.0x | 512x512 | Conv2d + PixelShuffle(2) |
-| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 2.0x | 512x512 | Same arch, newer weights |
+| `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | 2.0x | 512x512 | Conv2d + PixelShuffle(2) |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` (default) | 2.0x | 512x512 | Same arch, newer weights |
 | `ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors` | 1.5x | 384x384 | Conv2d + PixelShuffle(3) + BlurDownsample |
 
 ```bash
-# Default (x2-1.0, auto-detected)
-uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled
+# Default (x2-1.1, auto-detected)
+uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled
 
 # x2-1.1 (newer weights)
-uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
+uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
     --spatial-upscaler ltx-2.3-spatial-upscaler-x2-1.1.safetensors
 
 # x1.5 (smaller output, faster)
-uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
+uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
     --spatial-upscaler ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors
+
 ```
 
 > **Note:** Stage 1 always runs at half the target resolution. With x1.5, the final output is 75% of `--width`/`--height` (e.g., 512 target -> 256 stage 1 -> 384 output). With x2, the output matches the target exactly.
@@ -191,9 +205,9 @@ uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
 | `--cfg-rescale` | 0.7 | CFG rescale factor (reduces over-saturation) |
 | `--negative-prompt` | (default) | Negative prompt for CFG |
 | `--apg` | false | Use Adaptive Projected Guidance (more stable for I2V) |
-| `--stg-scale` | 0.0 | STG scale (PyTorch default: 1.0, requires `--audio`) |
+| `--stg-scale` | 1.0 | STG scale (set `0.0` to disable; requires `--audio`) |
 | `--stg-blocks` | None | Transformer blocks for STG ([29] for LTX-2, [28] for LTX-2.3) |
-| `--modality-scale` | 1.0 | Cross-modal guidance scale (PyTorch default: 3.0, requires `--audio`) |
+| `--modality-scale` | 3.0 | Cross-modal guidance scale (`1.0` disables extra modality guidance; requires `--audio`) |
 
 ### Dev-Two-Stage LoRA
 
@@ -209,6 +223,10 @@ uv run mlx_video.generate --prompt "A sunset" --model-repo ./LTX-2.3-distilled \
 | `--lora-strength-stage-1` | 0.25 | LoRA strength for stage 1 |
 | `--lora-strength-stage-2` | 0.5 | LoRA strength for stage 2 |
 
+### Distilled / Refinement
+
+When `--lora-path` is passed to the distilled pipeline, the LoRA weights are merged before the stage 2 refinement pass. Auto-detection is intentionally left to the two-stage pipelines only.
+
 HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses the res_2s second-order sampler (2 model evals per step) for better quality at the same compute budget.
 
 ## How It Works
@@ -216,7 +234,7 @@ HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses t
 ### Distilled Pipeline (default)
 1. **Stage 1**: Generate at half resolution with 8 denoising steps (fixed sigmas)
 2. **Upsample**: Spatial upsampling via LatentUpsampler (x2 or x1.5, selectable via `--spatial-upscaler`)
-3. **Stage 2**: Refine at upsampled resolution with 3 denoising steps
+3. **Stage 2**: Refine at upsampled resolution with 3 denoising steps; if `--lora-path` is set, LoRA is merged before this pass
 4. **Decode**: VAE decoder converts latents to RGB video
 
 ### Dev Pipeline

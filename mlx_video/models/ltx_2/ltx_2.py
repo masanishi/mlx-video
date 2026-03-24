@@ -16,7 +16,7 @@ from mlx_video.models.ltx_2.transformer import (
     Modality,
     TransformerArgs,
 )
-from mlx_video.utils import to_denoised
+from mlx_video.utils import resolve_safetensor_files, to_denoised
 
 
 class TransformerArgsPreprocessor:
@@ -675,7 +675,14 @@ class LTXModel(nn.Module):
 
         weights = {}
 
-        for weight_file in model_path.glob("*.safetensors"):
+        weight_files = resolve_safetensor_files(model_path)
+        if not weight_files:
+            raise FileNotFoundError(
+                f"No .safetensors weights found at {model_path}. "
+                "The transformer cache may be incomplete."
+            )
+
+        for weight_file in weight_files:
             weights.update(mx.load(str(weight_file)))
 
         sanitized = model.sanitize(weights)
