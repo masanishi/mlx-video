@@ -40,7 +40,7 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 
 ---
 
-## LTX-2
+## LTX-2 / LTX-2.3
 
 ### Text-to-Video Generation
 
@@ -48,8 +48,11 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 # Text-to-Video (distilled, fastest)
 uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
 
-# Image-to-Video
+# Image-to-Video (aspect ratio preserved via letterbox)
 uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg
+
+# Image-to-Video + synchronized audio generation
+uv run mlx_video.ltx_2.generate --prompt "A singer on stage" --image singer.png --audio
 
 # Audio-to-Video
 uv run mlx_video.ltx_2.generate --audio-file music.wav --prompt "A band playing music"
@@ -63,6 +66,38 @@ uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
     --model-repo prince-canuma/LTX-2-dev
 ```
 
+By default, `uv run mlx_video.ltx_2.generate` now uses `prince-canuma/LTX-2.3-distilled`. If that repo does not include an embedded text encoder, the CLI automatically resolves `google/gemma-3-12b-it` unless you pass `--text-encoder-repo` explicitly.
+
+### LoRA Support (LTX-2.3)
+
+LTX-2.3 supports LoRA merging in the distilled and two-stage pipelines:
+
+- `--pipeline distilled`: applies LoRA before stage 1 so it affects both stage 1 generation and stage 2 refinement when `--lora-path` is provided
+- `--pipeline dev-two-stage`: applies LoRA during the stage 2 distilled refinement pass
+- `--pipeline dev-two-stage-hq`: applies LoRA in both stages, with separate strengths for stage 1 and stage 2
+- For the two-stage pipelines, if `--lora-path` is omitted, the CLI tries to auto-detect a file matching `*distilled-lora*.safetensors` inside the selected model repo
+
+```bash
+# Dev two-stage with an explicit LoRA file
+uv run mlx_video.ltx_2.generate \
+    --pipeline dev-two-stage \
+    --model-repo prince-canuma/LTX-2.3-dev \
+    --prompt "A cinematic close-up of ocean waves at golden hour" \
+    --lora-path /path/to/ltx-2.3-distilled-lora.safetensors \
+    --lora-strength 1.0
+
+# Dev two-stage HQ with different LoRA strengths per stage
+uv run mlx_video.ltx_2.generate \
+    --pipeline dev-two-stage-hq \
+    --model-repo prince-canuma/LTX-2.3-dev \
+    --prompt "A fashion film shot with elegant camera movement" \
+    --lora-path /Users/masatonishihara/Documents/ComfyUI/models/loras/ltx-2.3-distilled-lora.safetensors \
+    --lora-strength-stage-1 0.25 \
+    --lora-strength-stage-2 0.5
+```
+
+For `dev-two-stage-hq`, `--lora-strength-stage-2` is the total target strength for stage 2. The pipeline adds only the difference from stage 1, so the default behavior is effectively `0.25` in stage 1 and `0.50` total in stage 2.
+
 <img src="https://github.com/Blaizzy/mlx-video/raw/main/examples/poodles.gif" width="512" alt="Poodles demo">
 
 **Converting weights:**
@@ -70,19 +105,29 @@ uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
 Pre-converted weights are available on HuggingFace ([LTX-2-distilled](https://huggingface.co/prince-canuma/LTX-2-distilled), [LTX-2-dev](https://huggingface.co/prince-canuma/LTX-2-dev), [LTX-2.3-distilled](https://huggingface.co/prince-canuma/LTX-2.3-distilled), [LTX-2.3-dev](https://huggingface.co/prince-canuma/LTX-2.3-dev)), or convert from the original Lightricks checkpoint:
 
 
-### LTX-2 CLI Options
+### LTX-2 / LTX-2.3 CLI Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--prompt`, `-p` | (required) | Text description of the video |
+| `--pipeline` | `distilled` | Pipeline type: `distilled`, `dev`, `dev-two-stage`, or `dev-two-stage-hq` |
 | `--height`, `-H` | 512 | Output height (must be divisible by 64) |
 | `--width`, `-W` | 512 | Output width (must be divisible by 64) |
-| `--num-frames`, `-n` | 100 | Number of frames |
+| `--num-frames`, `-n` | 33 | Number of frames |
 | `--seed`, `-s` | 42 | Random seed for reproducibility |
 | `--fps` | 24 | Frames per second |
-| `--output`, `-o` | output.mp4 | Output video path |
+| `--output-path`, `-o` | output.mp4 | Output video path |
 | `--save-frames` | false | Save individual frames as images |
-| `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+| `--model-repo` | prince-canuma/LTX-2.3-distilled | HuggingFace model repository |
+| `--text-encoder-repo` | None | Separate text encoder repo; auto-resolves `google/gemma-3-12b-it` if the model repo does not include one |
+| `--image`, `-i` | None | Conditioning image for I2V / I2V+Audio; letterboxed to preserve aspect ratio |
+| `--audio`, `-a` | false | Enable synchronized audio generation |
+| `--audio-file` | None | Path to audio file for A2V conditioning |
+| `--output-audio` | None | Optional output path for decoded audio |
+| `--lora-path` | None | Path to a LoRA safetensors file for `distilled` / `dev-two-stage` / `dev-two-stage-hq`; auto-detected from the model repo for the two-stage pipelines when omitted |
+| `--lora-strength` | 1.0 | LoRA merge strength for `--pipeline distilled` / `dev-two-stage` |
+| `--lora-strength-stage-1` | 0.25 | Stage 1 LoRA strength for `--pipeline dev-two-stage-hq` |
+| `--lora-strength-stage-2` | 0.5 | Total stage 2 LoRA strength for `--pipeline dev-two-stage-hq` |
 
 
 ---

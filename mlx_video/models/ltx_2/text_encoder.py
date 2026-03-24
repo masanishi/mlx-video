@@ -19,7 +19,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from mlx_video.utils import apply_quantization, rms_norm
+from mlx_video.utils import apply_quantization, resolve_safetensor_files, rms_norm
 
 # Path to system prompts
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -188,12 +188,18 @@ class LanguageModel(nn.Module):
     def from_pretrained(cls, model_path: str):
         import json
 
-        weight_files = sorted(Path(model_path).glob("*.safetensors"))
+        weight_files = resolve_safetensor_files(model_path)
         config_file = Path(model_path) / "config.json"
         config_dict = {}
         if config_file.exists():
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
+
+            if not weight_files:
+                raise FileNotFoundError(
+                    f"No .safetensors weights found at {model_path}. "
+                    "The text encoder cache may be incomplete."
+                )
 
             language_model = cls(
                 config=TextConfig.from_dict(config_dict["text_config"])

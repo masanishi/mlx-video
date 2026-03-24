@@ -540,20 +540,28 @@ def infer_vae_decoder_config(weights: Dict[str, mx.array], variant: str) -> dict
 
 
 def infer_vae_encoder_config(weights: Dict[str, mx.array]) -> dict:
-    """Return VAE encoder config (architecture is consistent across versions)."""
+    """Infer VAE encoder config from sanitized encoder weights."""
+    from mlx_video.models.ltx_2.video_vae.video_vae import (
+        infer_encoder_blocks_from_weights,
+    )
+
+    encoder_blocks = infer_encoder_blocks_from_weights(weights)
+    if encoder_blocks is None:
+        encoder_blocks = [
+            ("res_x", {"num_layers": 4}),
+            ("compress_space_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 6}),
+            ("compress_time_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 6}),
+            ("compress_all_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 2}),
+            ("compress_all_res", {"multiplier": 2}),
+            ("res_x", {"num_layers": 2}),
+        ]
+
     return {
         "convolution_dimensions": 3,
-        "encoder_blocks": [
-            ["res_x", {"num_layers": 4}],
-            ["compress_space_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_time_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-        ],
+        "encoder_blocks": [list(block) for block in encoder_blocks],
         "encoder_spatial_padding_mode": "zeros",
         "in_channels": 3,
         "latent_log_var": "uniform",

@@ -1,7 +1,8 @@
+import json
 import math
 from functools import partial
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -10,22 +11,93 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 
-def get_model_path(model_repo: str):
+DEFAULT_MODEL_ALLOW_PATTERNS = ["*.safetensors", "*.json"]
+
+
+def _path_has_required_files(path: Path, required_patterns: list[str]) -> bool:
+    """Check whether a downloaded model path contains all required file patterns."""
+    return all(any(path.rglob(pattern)) for pattern in required_patterns)
+
+
+def resolve_safetensor_files(model_path: Union[str, Path]) -> List[Path]:
+    """Resolve the canonical list of safetensors files for a model directory.
+
+    If a `*.safetensors.index.json` file is present, only the shard files listed in
+    its `weight_map` are returned. This avoids accidentally loading stray or stale
+    shard files that may coexist in the same directory.
+    """
+    model_path = Path(model_path)
+
+    index_files = sorted(model_path.glob("*.safetensors.index.json"))
+    if index_files:
+        with open(index_files[0], "r", encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        shard_names = []
+        seen = set()
+        for shard_name in weight_map.values():
+            if shard_name not in seen:
+                seen.add(shard_name)
+                shard_names.append(shard_name)
+
+        shard_paths = [model_path / shard_name for shard_name in shard_names]
+        missing = [path for path in shard_paths if not path.exists()]
+        if missing:
+            missing_str = ", ".join(path.name for path in missing)
+            raise FileNotFoundError(
+                f"Missing safetensor shard(s) referenced by index: {missing_str}"
+            )
+
+        return shard_paths
+
+    return sorted(model_path.glob("*.safetensors"))
+
+
+def get_model_path(
+    model_repo: str,
+    allow_patterns: Optional[list[str]] = None,
+    required_patterns: Optional[list[str]] = None,
+):
     """Get or download LTX-2 model path."""
+    allow_patterns = allow_patterns or DEFAULT_MODEL_ALLOW_PATTERNS
+    required_patterns = required_patterns or ["*.safetensors"]
+
     try:
         if Path(model_repo).exists():
             return Path(model_repo)
-        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
-    except Exception:
-        print("Downloading LTX-2 model weights...")
-        return Path(
+
+        path = Path(
             snapshot_download(
                 repo_id=model_repo,
-                local_files_only=False,
-                resume_download=True,
-                allow_patterns=["*.safetensors", "*.json"],
+                local_files_only=True,
+                allow_patterns=allow_patterns,
             )
         )
+
+        if _path_has_required_files(path, required_patterns):
+            return path
+
+        print("Model cache is incomplete. Downloading missing files...")
+    except Exception:
+        print("Downloading model weights...")
+
+    path = Path(
+        snapshot_download(
+            repo_id=model_repo,
+            local_files_only=False,
+            resume_download=True,
+            allow_patterns=allow_patterns,
+        )
+    )
+
+    if not _path_has_required_files(path, required_patterns):
+        required_str = ", ".join(required_patterns)
+        raise FileNotFoundError(
+            f"Downloaded model cache is still incomplete for {model_repo!r}. "
+            f"Required pattern(s): {required_str}"
+        )
+
+    return path
 
 
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
@@ -180,6 +252,26 @@ def get_timestep_embedding(
     return emb
 
 
+def _resize_image_with_letterbox(
+    image: Image.Image,
+    target_height: int,
+    target_width: int,
+) -> Image.Image:
+    """Resize an image to fit inside a box while preserving aspect ratio."""
+    orig_w, orig_h = image.size
+    scale = min(target_width / orig_w, target_height / orig_h)
+
+    resized_w = max(1, min(target_width, int(round(orig_w * scale))))
+    resized_h = max(1, min(target_height, int(round(orig_h * scale))))
+
+    resized = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+    offset_x = (target_width - resized_w) // 2
+    offset_y = (target_height - resized_h) // 2
+    canvas.paste(resized, (offset_x, offset_y))
+    return canvas
+
+
 def load_image(
     image_path: Union[str, Path],
     height: Optional[int] = None,
@@ -200,7 +292,7 @@ def load_image(
 
     # Resize if dimensions specified
     if height is not None and width is not None:
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        image = _resize_image_with_letterbox(image, height, width)
     elif height is not None or width is not None:
         # If only one dimension specified, resize preserving aspect ratio
         orig_w, orig_h = image.size
@@ -286,9 +378,11 @@ def prepare_image_for_encoding(
         image_np = np.array(image)
         if image_np.max() <= 1.0:
             image_np = (image_np * 255).astype(np.uint8)
+        else:
+            image_np = np.clip(image_np, 0, 255).astype(np.uint8)
         pil_image = Image.fromarray(image_np)
-        pil_image = pil_image.resize(
-            (target_width, target_height), Image.Resampling.LANCZOS
+        pil_image = _resize_image_with_letterbox(
+            pil_image, target_height, target_width
         )
         image = mx.array(np.array(pil_image).astype(np.float32) / 255.0)
 
