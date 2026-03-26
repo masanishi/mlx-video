@@ -206,6 +206,43 @@ class TestProgressiveFrameSaving:
             range(expected_frames)
         ), "Not all frame indices were covered"
 
+    def test_return_output_false_streams_remaining_frames_in_chunks(self):
+        """Verify streaming-only tiled decode can flush final frames without returning output."""
+        all_frame_indices = set()
+
+        def on_frames_ready(frames: mx.array, start_idx: int):
+            num_frames = frames.shape[2]
+            for i in range(num_frames):
+                all_frame_indices.add(start_idx + i)
+
+        def mock_decoder(
+            x, causal=False, timestep=None, debug=False, chunked_conv=False
+        ):
+            b, c, f, h, w = x.shape
+            out_f = 1 + (f - 1) * 8
+            out_h = h * 32
+            out_w = w * 32
+            return mx.random.normal((b, 3, out_f, out_h, out_w))
+
+        # Force spatial-only tiling with a single temporal tile so the remaining
+        # frame flush path is exercised.
+        tiling_config = TilingConfig.spatial_only(tile_size=128, overlap=64)
+        latents = mx.zeros((1, 128, 5, 5, 9))
+
+        output = decode_with_tiling(
+            decoder_fn=mock_decoder,
+            latents=latents,
+            tiling_config=tiling_config,
+            spatial_scale=32,
+            temporal_scale=8,
+            on_frames_ready=on_frames_ready,
+            return_output=False,
+        )
+
+        expected_frames = 1 + (5 - 1) * 8
+        assert output is None
+        assert all_frame_indices == set(range(expected_frames))
+
 
 class TestAutoChunkedConv:
     """Tests for auto-enabling chunked_conv based on tiling mode."""

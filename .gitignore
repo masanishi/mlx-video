@@ -8,3 +8,12 @@ config.json
 **.pyc
 __pycache__/*
 *.egg-info/*
+.venv/
+.pytest_cache/
+.tmp_*.py
+
+# Generated local outputs
+*.mp4
+*.wav
+*.png
+prompts.txt
