@@ -40,7 +40,11 @@ from mlx_video.models.ltx_2.transformer import Modality
 from mlx_video.models.ltx_2.upsampler import load_upsampler, upsample_latents
 from mlx_video.models.ltx_2.video_vae import VideoEncoder
 from mlx_video.models.ltx_2.video_vae.decoder import VideoDecoder
-from mlx_video.models.ltx_2.video_vae.tiling import TilingConfig
+from mlx_video.models.ltx_2.video_vae.tiling import (
+    SpatialTilingConfig,
+    TemporalTilingConfig,
+    TilingConfig,
+)
 from mlx_video.utils import (
     get_model_path,
     load_image,
@@ -82,6 +86,7 @@ AUDIO_LATENTS_PER_SECOND = (
 # embedded Gemma weights (e.g. LTX-2.3 pre-converted checkpoints).
 DEFAULT_TEXT_ENCODER_REPO = "google/gemma-3-12b-it"
 TEXT_ENCODER_ALLOW_PATTERNS = ["*.safetensors", "*.json", "*.model"]
+LORA_MERGE_BATCH_SIZE = 8
 
 # Default negative prompt for CFG (dev pipeline)
 # Matches PyTorch LTX-2 reference DEFAULT_NEGATIVE_PROMPT from constants.py
@@ -148,7 +153,8 @@ def load_and_merge_lora(
     # Detect format: raw PyTorch has 'diffusion_model.' prefix
     has_prefix = any(k.startswith("diffusion_model.") for k in lora_weights)
 
-    # Group into A/B pairs by module name
+    # Group into A/B pairs by module name, storing source keys so weights can be
+    # dropped from memory as soon as they are merged.
     lora_pairs = {}
     for key in lora_weights:
         module_key = key
@@ -159,10 +165,10 @@ def load_and_merge_lora(
 
         if module_key.endswith(".lora_A.weight"):
             base_key = module_key.replace(".lora_A.weight", "")
-            lora_pairs.setdefault(base_key, {})["A"] = lora_weights[key]
+            lora_pairs.setdefault(base_key, {})["A_key"] = key
         elif module_key.endswith(".lora_B.weight"):
             base_key = module_key.replace(".lora_B.weight", "")
-            lora_pairs.setdefault(base_key, {})["B"] = lora_weights[key]
+            lora_pairs.setdefault(base_key, {})["B_key"] = key
 
     # Apply key sanitization only for raw PyTorch format
     # Replacements handle both mid-string and end-of-string positions
@@ -202,46 +208,62 @@ def load_and_merge_lora(
 
     flat_weights = flatten_params(dict(model.parameters()))
 
-    # Merge LoRA deltas in batches to avoid doubling memory
+    # Merge LoRA deltas in small batches to avoid large transient spikes.
     merged_count = 0
+    total_complete_pairs = 0
+    skipped_pairs = []
     batch = []
-    batch_size = 100  # merge 100 weights at a time, then eval to free intermediates
+    batch_size = LORA_MERGE_BATCH_SIZE
 
     for module_key, pair in sanitized_pairs.items():
-        if "A" not in pair or "B" not in pair:
+        if "A_key" not in pair or "B_key" not in pair:
             continue
+        total_complete_pairs += 1
 
         weight_key = f"{module_key}.weight"
         if weight_key not in flat_weights:
+            skipped_pairs.append(module_key)
+            lora_weights.pop(pair["A_key"], None)
+            lora_weights.pop(pair["B_key"], None)
             continue
 
-        lora_a = pair["A"].astype(mx.float32)  # (rank, in_features)
-        lora_b = pair["B"].astype(mx.float32)  # (out_features, rank)
+        lora_a = lora_weights.pop(pair["A_key"]).astype(mx.float32)  # (rank, in_features)
+        lora_b = lora_weights.pop(pair["B_key"]).astype(mx.float32)  # (out_features, rank)
 
         # delta = (lora_B * strength) @ lora_A
         delta = (lora_b * strength) @ lora_a
 
         base_weight = flat_weights.pop(weight_key)
-        merged_weight = (base_weight.astype(mx.float32) + delta).astype(
-            base_weight.dtype
-        )
+        merged_weight = base_weight + delta.astype(base_weight.dtype)
         batch.append((weight_key, merged_weight))
-        del base_weight
+        del lora_a, lora_b, delta, base_weight
         merged_count += 1
 
         if len(batch) >= batch_size:
             model.load_weights(batch, strict=False)
             mx.eval(model.parameters())
             batch.clear()
+            gc.collect()
+            mx.clear_cache()
 
     if batch:
         model.load_weights(batch, strict=False)
         mx.eval(model.parameters())
         batch.clear()
+        gc.collect()
+        mx.clear_cache()
 
     del flat_weights, lora_weights
     mx.clear_cache()
-    console.print(f"[green]✓[/] Merged {merged_count} LoRA pairs (strength={strength})")
+    if skipped_pairs:
+        sample = ", ".join(skipped_pairs[:5])
+        extra = "..." if len(skipped_pairs) > 5 else ""
+        console.print(
+            f"[yellow]⚠[/] Skipped {len(skipped_pairs)} unmatched LoRA pairs: {sample}{extra}[/]"
+        )
+    console.print(
+        f"[green]✓[/] Merged {merged_count}/{total_complete_pairs} LoRA pairs (strength={strength})"
+    )
 
 
 def cfg_delta(cond: mx.array, uncond: mx.array, scale: float) -> mx.array:
@@ -1689,6 +1711,44 @@ def set_attention_query_chunk_size(model: LTXModel, query_chunk_size: Optional[i
                 attention.query_chunk_size = query_chunk_size
 
 
+def resolve_attention_query_chunk_size(
+    *,
+    low_memory: bool,
+    num_tokens: int,
+) -> Optional[int]:
+    """Choose an attention query chunk size from the active token count.
+
+    Short clips can still produce large token counts at higher resolutions, so the
+    decision should be based on tokens rather than clip duration alone.
+    """
+    if not low_memory:
+        return None
+
+    if num_tokens <= 8_192:
+        return None
+    if num_tokens <= 32_768:
+        return 4_096
+    return 2_048
+
+
+def configure_attention_query_chunking(
+    model: LTXModel,
+    *,
+    low_memory: bool,
+    latent_frames: int,
+    latent_h: int,
+    latent_w: int,
+) -> Optional[int]:
+    """Apply token-aware attention chunking to the transformer in-place."""
+    num_tokens = latent_frames * latent_h * latent_w
+    query_chunk_size = resolve_attention_query_chunk_size(
+        low_memory=low_memory,
+        num_tokens=num_tokens,
+    )
+    set_attention_query_chunk_size(model, query_chunk_size)
+    return query_chunk_size
+
+
 def strip_transformer_to_video_only(model: LTXModel) -> None:
     """Drop audio/cross-modal modules so Stage 2 can run with a smaller resident model.
 
@@ -1829,20 +1889,45 @@ def resolve_decode_tiling_mode(
     width: int,
     num_frames: int,
 ) -> str:
-    """Choose the decode tiling mode, escalating to aggressive for huge low-memory decodes.
+    """Choose the decode tiling mode for low-memory decode.
 
-    Conservative tiling keeps larger tiles for better throughput, but on very large
-    videos the per-tile VAE working set can still spike badly. For low-memory runs we
-    prefer smaller decode tiles once the output volume gets large enough.
+    For short clips, temporal tiling is often unnecessary overhead, so prefer
+    spatial-only tiling once the output is large enough. Fall back to aggressive
+    tiling for longer clips where temporal tiling still helps control memory.
     """
     if not low_memory or tiling != "conservative":
         return tiling
 
     output_pixels = height * width * num_frames
+    if output_pixels < 75_000_000:
+        return tiling
+
+    if num_frames <= 241:
+        return "spatial"
+
     if output_pixels >= 75_000_000:
         return "aggressive"
 
     return tiling
+
+
+def resolve_stage2_sigma_schedule(stage2_refinement_steps: int) -> list[float]:
+    """Return the Stage 2 distilled sigma schedule for 0-3 refinement steps.
+
+    The full distilled Stage 2 schedule is 3 steps. Fewer steps keep the same
+    initial sigma and terminal 0.0 endpoint while skipping intermediate sigmas.
+    """
+    schedules = {
+        0: [],
+        1: [STAGE_2_SIGMAS[0], STAGE_2_SIGMAS[-1]],
+        2: [STAGE_2_SIGMAS[0], STAGE_2_SIGMAS[-2], STAGE_2_SIGMAS[-1]],
+        3: STAGE_2_SIGMAS,
+    }
+    if stage2_refinement_steps not in schedules:
+        raise ValueError(
+            f"stage2_refinement_steps must be between 0 and 3, got {stage2_refinement_steps}"
+        )
+    return schedules[stage2_refinement_steps]
 
 
 def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
@@ -1974,6 +2059,9 @@ def generate_video(
     spatial_upscaler: Optional[str] = None,
     low_memory: bool = False,
     profile_memory: bool = False,
+    skip_stage2_refinement: bool = False,
+    stage2_refinement_steps: Optional[int] = None,
+    return_video: bool = True,
 ):
     """Generate video using LTX-2 / LTX-2.3 models.
 
@@ -2014,6 +2102,12 @@ def generate_video(
         apg_norm_threshold: APG guidance norm clamp (0 = no clamping)
         low_memory: Apply safer low-memory defaults for Apple Silicon execution.
         profile_memory: Print phase-local MLX memory measurements.
+        skip_stage2_refinement: Experimental two-stage shortcut that decodes the
+            upsampled Stage 1 result without running Stage 2 refinement.
+        stage2_refinement_steps: Experimental Stage 2 step count override for
+            two-stage pipelines. Valid values are 0-3.
+        return_video: Whether to return the decoded video array to the caller.
+            CLI execution can disable this to avoid a final full-video memory spike.
     """
     start_time = time.time()
     memory_profiler = MemoryProfiler(enabled=profile_memory, console=console)
@@ -2027,6 +2121,27 @@ def generate_video(
     divisor = 64 if is_two_stage else 32
     assert height % divisor == 0, f"Height must be divisible by {divisor}, got {height}"
     assert width % divisor == 0, f"Width must be divisible by {divisor}, got {width}"
+
+    if (skip_stage2_refinement or stage2_refinement_steps is not None) and not is_two_stage:
+        raise ValueError(
+            "Stage 2 refinement controls are only supported for two-stage pipelines."
+        )
+    if skip_stage2_refinement and stage2_refinement_steps not in (None, 0):
+        raise ValueError(
+            "--skip-stage2-refinement cannot be combined with --stage2-refinement-steps > 0."
+        )
+
+    effective_stage2_steps = (
+        0
+        if skip_stage2_refinement
+        else (
+            stage2_refinement_steps
+            if stage2_refinement_steps is not None
+            else len(STAGE_2_SIGMAS) - 1
+        )
+    )
+    stage2_sigmas = resolve_stage2_sigma_schedule(effective_stage2_steps)
+    skip_stage2_refinement = effective_stage2_steps == 0
 
     if num_frames % 8 != 1:
         adjusted_num_frames = round((num_frames - 1) / 8) * 8 + 1
@@ -2047,7 +2162,6 @@ def generate_video(
 
     low_memory_adjustments = []
     low_memory_stage2_video_only = False
-    attention_query_chunk_size = None
     if low_memory:
         if tiling in ("auto", "none", "default"):
             tiling = "conservative"
@@ -2066,10 +2180,7 @@ def generate_video(
         if audio and pipeline in (PipelineType.DISTILLED, PipelineType.DEV_TWO_STAGE):
             low_memory_stage2_video_only = True
             low_memory_adjustments.append("stage2-audio-refine=off")
-        attention_query_chunk_size = 2048
-        low_memory_adjustments.append(
-            f"query-chunk={attention_query_chunk_size}"
-        )
+        low_memory_adjustments.append("query-chunk=adaptive")
 
     mode_str = "I2V" if is_i2v else "T2V"
     if is_a2v:
@@ -2092,6 +2203,12 @@ def generate_video(
         console.print(f"[dim]Low-memory mode: on ({adjustments})[/]")
     if profile_memory:
         console.print("[dim]Memory profiling: on[/]")
+    if skip_stage2_refinement:
+        console.print("[dim]Stage 2 refinement: skipped after upsample (experimental)[/]")
+    elif is_two_stage and effective_stage2_steps != len(STAGE_2_SIGMAS) - 1:
+        console.print(
+            f"[dim]Stage 2 refinement: {effective_stage2_steps}/{len(STAGE_2_SIGMAS) - 1} steps (experimental)[/]"
+        )
 
     if pipeline in (
         PipelineType.DEV,
@@ -2243,7 +2360,6 @@ def generate_video(
         transformer = LTXModel.from_pretrained(
             model_path=model_path / "transformer", strict=True
         )
-        set_attention_query_chunk_size(transformer, attention_query_chunk_size)
 
     console.print("[green]✓[/] Transformer loaded")
     memory_profiler.log("transformer loaded")
@@ -2424,6 +2540,14 @@ def generate_video(
             )
             mx.eval(latents)
 
+        configure_attention_query_chunking(
+            transformer,
+            low_memory=low_memory,
+            latent_frames=latent_frames,
+            latent_h=stage1_h,
+            latent_w=stage1_w,
+        )
+
         latents, audio_latents = denoise_distilled(
             latents,
             positions,
@@ -2452,6 +2576,10 @@ def generate_video(
             )
             strip_transformer_to_video_only(transformer)
             memory_profiler.log("stage 2 model trimmed")
+        if skip_stage2_refinement and transformer is not None:
+            del transformer
+            transformer = None
+            mx.clear_cache()
 
         # Upsample latents
         memory_profiler.start("upsample")
@@ -2478,93 +2606,107 @@ def generate_video(
         console.print("[green]✓[/] Latents upsampled")
         memory_profiler.log("upsample complete")
 
-        # Stage 2
-        console.print(
-            f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w*32}x{stage2_h*32} (3 steps)"
-        )
-        if low_memory_stage2_video_only:
+        if skip_stage2_refinement:
             console.print(
-                "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
+                "[dim]Stage 2 refinement skipped; decoding upsampled Stage 1 latents[/]"
             )
-        positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
-        mx.eval(positions)
 
-        state2 = None
-        if is_i2v:
-            memory_profiler.start("stage 2 conditioning")
-            with console.status(
-                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
-            ):
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                stage2_image_latent = encode_conditioning_image_latent(
-                    model_path=model_path,
-                    image_path=image,
-                    height=s2_h,
-                    width=s2_w,
-                    dtype=model_dtype,
+        # Stage 2
+        if not skip_stage2_refinement:
+            console.print(
+                f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w*32}x{stage2_h*32} ({effective_stage2_steps} steps)"
+            )
+            if low_memory_stage2_video_only:
+                console.print(
+                    "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
                 )
-            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+            positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            mx.eval(positions)
 
-            state2 = LatentState(
-                latent=latents,
-                clean_latent=mx.zeros_like(latents),
-                denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
+            state2 = None
+            if is_i2v:
+                memory_profiler.start("stage 2 conditioning")
+                with console.status(
+                    "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+                ):
+                    s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                    stage2_image_latent = encode_conditioning_image_latent(
+                        model_path=model_path,
+                        image_path=image,
+                        height=s2_h,
+                        width=s2_w,
+                        dtype=model_dtype,
+                    )
+                console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
+                state2 = LatentState(
+                    latent=latents,
+                    clean_latent=mx.zeros_like(latents),
+                    denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
+                )
+                conditioning = VideoConditionByLatentIndex(
+                    latent=stage2_image_latent,
+                    frame_idx=image_frame_idx,
+                    strength=image_strength,
+                )
+                state2 = apply_conditioning(state2, [conditioning])
+
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                scaled_mask = state2.denoise_mask * noise_scale
+                state2 = LatentState(
+                    latent=noise * scaled_mask
+                    + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
+                    clean_latent=state2.clean_latent,
+                    denoise_mask=state2.denoise_mask,
+                )
+                latents = state2.latent
+                mx.eval(latents)
+                del stage2_image_latent
+                memory_profiler.log("stage 2 conditioning ready")
+            else:
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                one_minus_scale = mx.array(1.0 - stage2_sigmas[0], dtype=model_dtype)
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                latents = noise * noise_scale + latents * one_minus_scale
+                mx.eval(latents)
+
+            configure_attention_query_chunking(
+                transformer,
+                low_memory=low_memory,
+                latent_frames=latent_frames,
+                latent_h=stage2_h,
+                latent_w=stage2_w,
             )
-            conditioning = VideoConditionByLatentIndex(
-                latent=stage2_image_latent,
-                frame_idx=image_frame_idx,
-                strength=image_strength,
+
+            memory_profiler.start("stage 2 denoise")
+
+            # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
+            if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
+                audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
+                audio_noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                audio_latents = audio_noise * audio_noise_scale + audio_latents * (
+                    mx.array(1.0, dtype=model_dtype) - audio_noise_scale
+                )
+                mx.eval(audio_latents)
+
+            # Joint video + audio refinement (no CFG, positive embeddings only)
+            latents, refined_audio_latents = denoise_distilled(
+                latents,
+                positions,
+                text_embeddings,
+                transformer,
+                stage2_sigmas,
+                verbose=verbose,
+                state=state2,
+                audio_latents=None if low_memory_stage2_video_only else audio_latents,
+                audio_positions=None if low_memory_stage2_video_only else audio_positions,
+                audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings,
+                audio_frozen=is_a2v,
             )
-            state2 = apply_conditioning(state2, [conditioning])
-
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            scaled_mask = state2.denoise_mask * noise_scale
-            state2 = LatentState(
-                latent=noise * scaled_mask
-                + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
-                clean_latent=state2.clean_latent,
-                denoise_mask=state2.denoise_mask,
-            )
-            latents = state2.latent
-            mx.eval(latents)
-            del stage2_image_latent
-            memory_profiler.log("stage 2 conditioning ready")
-        else:
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            latents = noise * noise_scale + latents * one_minus_scale
-            mx.eval(latents)
-
-        memory_profiler.start("stage 2 denoise")
-
-        # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
-        if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
-            audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
-            audio_noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            audio_latents = audio_noise * audio_noise_scale + audio_latents * (
-                mx.array(1.0, dtype=model_dtype) - audio_noise_scale
-            )
-            mx.eval(audio_latents)
-
-        # Joint video + audio refinement (no CFG, positive embeddings only)
-        latents, refined_audio_latents = denoise_distilled(
-            latents,
-            positions,
-            text_embeddings,
-            transformer,
-            STAGE_2_SIGMAS,
-            verbose=verbose,
-            state=state2,
-            audio_latents=None if low_memory_stage2_video_only else audio_latents,
-            audio_positions=None if low_memory_stage2_video_only else audio_positions,
-            audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings,
-            audio_frozen=is_a2v,
-        )
-        if refined_audio_latents is not None:
-            audio_latents = refined_audio_latents
-        memory_profiler.log("stage 2 complete")
+            if refined_audio_latents is not None:
+                audio_latents = refined_audio_latents
+            memory_profiler.log("stage 2 complete")
 
     elif pipeline == PipelineType.DEV:
         # ======================================================================
@@ -2650,6 +2792,14 @@ def generate_video(
         else:
             latents = mx.random.normal(video_latent_shape, dtype=model_dtype)
             mx.eval(latents)
+
+        configure_attention_query_chunking(
+            transformer,
+            low_memory=low_memory,
+            latent_frames=latent_frames,
+            latent_h=latent_h,
+            latent_w=latent_w,
+        )
 
         # Always use A/V denoising - PyTorch always processes audio+video jointly
         latents, audio_latents = denoise_dev_av(
@@ -2765,6 +2915,14 @@ def generate_video(
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
 
+        configure_attention_query_chunking(
+            transformer,
+            low_memory=low_memory,
+            latent_frames=latent_frames,
+            latent_h=stage1_h,
+            latent_w=stage1_w,
+        )
+
         # Stage 1: Always use joint AV denoising (matches PyTorch)
         latents, audio_latents = denoise_dev_av(
             latents,
@@ -2801,6 +2959,11 @@ def generate_video(
         mx.clear_cache()
         memory_profiler.log("stage 1 complete")
 
+        if skip_stage2_refinement:
+            del transformer
+            transformer = None
+            mx.clear_cache()
+
         # Upsample latents
         memory_profiler.start("upsample")
         with console.status(
@@ -2826,8 +2989,13 @@ def generate_video(
         console.print("[green]✓[/] Latents upsampled")
         memory_profiler.log("upsample complete")
 
+        if skip_stage2_refinement:
+            console.print(
+                "[dim]Stage 2 refinement skipped; decoding upsampled Stage 1 latents[/]"
+            )
+
         # Merge LoRA weights for stage 2 (distilled refinement)
-        if lora_path is None:
+        if not skip_stage2_refinement and lora_path is None:
             # Auto-detect LoRA file in model directory
             lora_files = sorted(model_path.glob("*distilled-lora*.safetensors"))
             if lora_files:
@@ -2838,13 +3006,13 @@ def generate_video(
                     "[yellow]⚠️  No LoRA file found. Stage 2 will use base weights.[/]"
                 )
 
-        if lora_path is not None:
+        if not skip_stage2_refinement and lora_path is not None:
             with console.status(
                 "[blue]🔧 Merging distilled LoRA weights...[/]", spinner="dots"
             ):
                 load_and_merge_lora(transformer, lora_path, strength=lora_strength)
 
-        if low_memory_stage2_video_only:
+        if not skip_stage2_refinement and low_memory_stage2_video_only:
             memory_profiler.start("stage 2 model trim")
             console.print(
                 "[dim]Low-memory: stripping transformer audio/cross-modal modules before Stage 2[/]"
@@ -2855,92 +3023,101 @@ def generate_video(
         # Stage 2: Distilled refinement at full resolution (no CFG)
         # Matches PyTorch: re-noise audio at sigma=0.909375, then jointly refine
         # both video and audio through the distilled schedule using the LoRA-merged model.
-        console.print(
-            f"\n[bold yellow]⚡ Stage 2:[/] Distilled refining at {width}x{height} (3 steps, no CFG)"
-        )
-        if low_memory_stage2_video_only:
+        if not skip_stage2_refinement:
             console.print(
-                "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
+                f"\n[bold yellow]⚡ Stage 2:[/] Distilled refining at {width}x{height} ({effective_stage2_steps} steps, no CFG)"
             )
-        positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
-        mx.eval(positions)
-
-        state2 = None
-        if is_i2v:
-            memory_profiler.start("stage 2 conditioning")
-            with console.status(
-                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
-            ):
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                stage2_image_latent = encode_conditioning_image_latent(
-                    model_path=model_path,
-                    image_path=image,
-                    height=s2_h,
-                    width=s2_w,
-                    dtype=model_dtype,
+            if low_memory_stage2_video_only:
+                console.print(
+                    "[dim]Low-memory: Stage 2 audio refinement disabled; reusing Stage 1 audio latents[/]"
                 )
-            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+            positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            mx.eval(positions)
 
-            state2 = LatentState(
-                latent=latents,
-                clean_latent=mx.zeros_like(latents),
-                denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
+            state2 = None
+            if is_i2v:
+                memory_profiler.start("stage 2 conditioning")
+                with console.status(
+                    "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+                ):
+                    s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                    stage2_image_latent = encode_conditioning_image_latent(
+                        model_path=model_path,
+                        image_path=image,
+                        height=s2_h,
+                        width=s2_w,
+                        dtype=model_dtype,
+                    )
+                console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
+                state2 = LatentState(
+                    latent=latents,
+                    clean_latent=mx.zeros_like(latents),
+                    denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
+                )
+                conditioning = VideoConditionByLatentIndex(
+                    latent=stage2_image_latent,
+                    frame_idx=image_frame_idx,
+                    strength=image_strength,
+                )
+                state2 = apply_conditioning(state2, [conditioning])
+
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                scaled_mask = state2.denoise_mask * noise_scale
+                state2 = LatentState(
+                    latent=noise * scaled_mask
+                    + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
+                    clean_latent=state2.clean_latent,
+                    denoise_mask=state2.denoise_mask,
+                )
+                latents = state2.latent
+                mx.eval(latents)
+                del stage2_image_latent
+                memory_profiler.log("stage 2 conditioning ready")
+            else:
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                one_minus_scale = mx.array(1.0 - stage2_sigmas[0], dtype=model_dtype)
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                latents = noise * noise_scale + latents * one_minus_scale
+                mx.eval(latents)
+
+            configure_attention_query_chunking(
+                transformer,
+                low_memory=low_memory,
+                latent_frames=latent_frames,
+                latent_h=stage2_h,
+                latent_w=stage2_w,
             )
-            conditioning = VideoConditionByLatentIndex(
-                latent=stage2_image_latent,
-                frame_idx=image_frame_idx,
-                strength=image_strength,
+
+            memory_profiler.start("stage 2 denoise")
+
+            # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
+            if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
+                audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
+                audio_noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                audio_latents = audio_noise * audio_noise_scale + audio_latents * (
+                    mx.array(1.0, dtype=model_dtype) - audio_noise_scale
+                )
+                mx.eval(audio_latents)
+
+            # Joint video + audio refinement (no CFG, positive embeddings only)
+            latents, refined_audio_latents = denoise_distilled(
+                latents,
+                positions,
+                text_embeddings,
+                transformer,
+                stage2_sigmas,
+                verbose=verbose,
+                state=state2,
+                audio_latents=None if low_memory_stage2_video_only else audio_latents,
+                audio_positions=None if low_memory_stage2_video_only else audio_positions,
+                audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings_pos,
+                audio_frozen=is_a2v,
             )
-            state2 = apply_conditioning(state2, [conditioning])
-
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            scaled_mask = state2.denoise_mask * noise_scale
-            state2 = LatentState(
-                latent=noise * scaled_mask
-                + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
-                clean_latent=state2.clean_latent,
-                denoise_mask=state2.denoise_mask,
-            )
-            latents = state2.latent
-            mx.eval(latents)
-            del stage2_image_latent
-            memory_profiler.log("stage 2 conditioning ready")
-        else:
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            latents = noise * noise_scale + latents * one_minus_scale
-            mx.eval(latents)
-
-        memory_profiler.start("stage 2 denoise")
-
-        # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
-        if audio_latents is not None and not is_a2v and not low_memory_stage2_video_only:
-            audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
-            audio_noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            audio_latents = audio_noise * audio_noise_scale + audio_latents * (
-                mx.array(1.0, dtype=model_dtype) - audio_noise_scale
-            )
-            mx.eval(audio_latents)
-
-        # Joint video + audio refinement (no CFG, positive embeddings only)
-        latents, refined_audio_latents = denoise_distilled(
-            latents,
-            positions,
-            text_embeddings,
-            transformer,
-            STAGE_2_SIGMAS,
-            verbose=verbose,
-            state=state2,
-            audio_latents=None if low_memory_stage2_video_only else audio_latents,
-            audio_positions=None if low_memory_stage2_video_only else audio_positions,
-            audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings_pos,
-            audio_frozen=is_a2v,
-        )
-        if refined_audio_latents is not None:
-            audio_latents = refined_audio_latents
-        memory_profiler.log("stage 2 complete")
+            if refined_audio_latents is not None:
+                audio_latents = refined_audio_latents
+            memory_profiler.log("stage 2 complete")
 
     elif pipeline == PipelineType.DEV_TWO_STAGE_HQ:
         # ======================================================================
@@ -3063,6 +3240,14 @@ def generate_video(
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
 
+        configure_attention_query_chunking(
+            transformer,
+            low_memory=low_memory,
+            latent_frames=latent_frames,
+            latent_h=stage1_h,
+            latent_w=stage1_w,
+        )
+
         # Stage 1: res_2s with CFG (STG disabled for HQ by default)
         latents, audio_latents = denoise_res2s_av(
             latents,
@@ -3098,6 +3283,11 @@ def generate_video(
         mx.clear_cache()
         memory_profiler.log("stage 1 complete")
 
+        if skip_stage2_refinement:
+            del transformer
+            transformer = None
+            mx.clear_cache()
+
         # Upsample latents
         memory_profiler.start("upsample")
         with console.status(
@@ -3123,8 +3313,13 @@ def generate_video(
         console.print("[green]✓[/] Latents upsampled")
         memory_profiler.log("upsample complete")
 
+        if skip_stage2_refinement:
+            console.print(
+                "[dim]Stage 2 refinement skipped; decoding upsampled Stage 1 latents[/]"
+            )
+
         # Merge additional LoRA for stage 2 (additive: 0.25 + 0.25 = 0.5 total)
-        if lora_path is not None:
+        if not skip_stage2_refinement and lora_path is not None:
             additional_strength = hq_lora_strength_s2 - hq_lora_strength_s1
             if additional_strength > 0:
                 with console.status(
@@ -3136,95 +3331,104 @@ def generate_video(
                     )
 
         # Stage 2: res_2s refinement at full resolution (no CFG)
-        console.print(
-            f"\n[bold yellow]Stage 2:[/] res_2s refining at {stage2_w*32}x{stage2_h*32} (3 steps, no CFG)"
-        )
-        positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
-        mx.eval(positions)
+        if not skip_stage2_refinement:
+            console.print(
+                f"\n[bold yellow]Stage 2:[/] res_2s refining at {stage2_w*32}x{stage2_h*32} ({effective_stage2_steps} steps, no CFG)"
+            )
+            positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            mx.eval(positions)
 
-        state2 = None
-        if is_i2v:
-            memory_profiler.start("stage 2 conditioning")
-            with console.status(
-                "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
-            ):
-                s2_h, s2_w = stage2_h * 32, stage2_w * 32
-                stage2_image_latent = encode_conditioning_image_latent(
-                    model_path=model_path,
-                    image_path=image,
-                    height=s2_h,
-                    width=s2_w,
-                    dtype=model_dtype,
+            state2 = None
+            if is_i2v:
+                memory_profiler.start("stage 2 conditioning")
+                with console.status(
+                    "[blue]🖼️  Encoding Stage 2 image conditioning...[/]", spinner="dots"
+                ):
+                    s2_h, s2_w = stage2_h * 32, stage2_w * 32
+                    stage2_image_latent = encode_conditioning_image_latent(
+                        model_path=model_path,
+                        image_path=image,
+                        height=s2_h,
+                        width=s2_w,
+                        dtype=model_dtype,
+                    )
+                console.print("[green]✓[/] Stage 2 image conditioning encoded")
+
+                state2 = LatentState(
+                    latent=latents,
+                    clean_latent=mx.zeros_like(latents),
+                    denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
                 )
-            console.print("[green]✓[/] Stage 2 image conditioning encoded")
+                conditioning = VideoConditionByLatentIndex(
+                    latent=stage2_image_latent,
+                    frame_idx=image_frame_idx,
+                    strength=image_strength,
+                )
+                state2 = apply_conditioning(state2, [conditioning])
 
-            state2 = LatentState(
-                latent=latents,
-                clean_latent=mx.zeros_like(latents),
-                denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                scaled_mask = state2.denoise_mask * noise_scale
+                state2 = LatentState(
+                    latent=noise * scaled_mask
+                    + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
+                    clean_latent=state2.clean_latent,
+                    denoise_mask=state2.denoise_mask,
+                )
+                latents = state2.latent
+                mx.eval(latents)
+                del stage2_image_latent
+                memory_profiler.log("stage 2 conditioning ready")
+            else:
+                noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                one_minus_scale = mx.array(1.0 - stage2_sigmas[0], dtype=model_dtype)
+                noise = mx.random.normal(latents.shape).astype(model_dtype)
+                latents = noise * noise_scale + latents * one_minus_scale
+                mx.eval(latents)
+
+            configure_attention_query_chunking(
+                transformer,
+                low_memory=low_memory,
+                latent_frames=latent_frames,
+                latent_h=stage2_h,
+                latent_w=stage2_w,
             )
-            conditioning = VideoConditionByLatentIndex(
-                latent=stage2_image_latent,
-                frame_idx=image_frame_idx,
-                strength=image_strength,
+
+            memory_profiler.start("stage 2 denoise")
+
+            # Re-noise audio at sigma=0.909375 for joint refinement
+            if audio_latents is not None and not is_a2v:
+                audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
+                audio_noise_scale = mx.array(stage2_sigmas[0], dtype=model_dtype)
+                audio_latents = audio_noise * audio_noise_scale + audio_latents * (
+                    mx.array(1.0, dtype=model_dtype) - audio_noise_scale
+                )
+                mx.eval(audio_latents)
+
+            # Stage 2: res_2s with no CFG (positive embeddings only)
+            latents, audio_latents = denoise_res2s_av(
+                latents,
+                audio_latents,
+                positions,
+                audio_positions,
+                video_embeddings_pos,
+                video_embeddings_pos,  # both pos (no neg for stage 2)
+                audio_embeddings_pos,
+                audio_embeddings_pos,
+                transformer,
+                mx.array(stage2_sigmas, dtype=mx.float32),
+                cfg_scale=1.0,  # no CFG
+                audio_cfg_scale=1.0,
+                cfg_rescale=0.0,
+                verbose=verbose,
+                video_state=state2,
+                noise_seed=seed + 1,
+                audio_frozen=is_a2v,
             )
-            state2 = apply_conditioning(state2, [conditioning])
+            memory_profiler.log("stage 2 complete")
 
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            scaled_mask = state2.denoise_mask * noise_scale
-            state2 = LatentState(
-                latent=noise * scaled_mask
-                + state2.latent * (mx.array(1.0, dtype=model_dtype) - scaled_mask),
-                clean_latent=state2.clean_latent,
-                denoise_mask=state2.denoise_mask,
-            )
-            latents = state2.latent
-            mx.eval(latents)
-            del stage2_image_latent
-            memory_profiler.log("stage 2 conditioning ready")
-        else:
-            noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
-            noise = mx.random.normal(latents.shape).astype(model_dtype)
-            latents = noise * noise_scale + latents * one_minus_scale
-            mx.eval(latents)
-
-        memory_profiler.start("stage 2 denoise")
-
-        # Re-noise audio at sigma=0.909375 for joint refinement
-        if audio_latents is not None and not is_a2v:
-            audio_noise = mx.random.normal(audio_latents.shape, dtype=model_dtype)
-            audio_noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
-            audio_latents = audio_noise * audio_noise_scale + audio_latents * (
-                mx.array(1.0, dtype=model_dtype) - audio_noise_scale
-            )
-            mx.eval(audio_latents)
-
-        # Stage 2: res_2s with no CFG (positive embeddings only)
-        stage2_sigmas = mx.array(STAGE_2_SIGMAS, dtype=mx.float32)
-        latents, audio_latents = denoise_res2s_av(
-            latents,
-            audio_latents,
-            positions,
-            audio_positions,
-            video_embeddings_pos,
-            video_embeddings_pos,  # both pos (no neg for stage 2)
-            audio_embeddings_pos,
-            audio_embeddings_pos,
-            transformer,
-            stage2_sigmas,
-            cfg_scale=1.0,  # no CFG
-            audio_cfg_scale=1.0,
-            cfg_rescale=0.0,
-            verbose=verbose,
-            video_state=state2,
-            noise_seed=seed + 1,
-            audio_frozen=is_a2v,
-        )
-        memory_profiler.log("stage 2 complete")
-
-    del transformer
+    if transformer is not None:
+        del transformer
     mx.clear_cache()
 
     if pipeline != PipelineType.DEV:
@@ -3261,7 +3465,8 @@ def generate_video(
     elif decode_tiling_mode == "conservative":
         tiling_config = TilingConfig.conservative()
     elif decode_tiling_mode == "spatial":
-        tiling_config = TilingConfig.spatial_only()
+        spatial_tile_size = 768 if low_memory and num_frames <= 241 else 512
+        tiling_config = TilingConfig.spatial_only(tile_size=spatial_tile_size)
     elif decode_tiling_mode == "temporal":
         tiling_config = TilingConfig.temporal_only()
     else:
@@ -3273,15 +3478,43 @@ def generate_video(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Stream mode
+    # Stream mode / low-memory tiled flush mode
     video_writer = None
     stream_progress = None
+    captured_frame_chunks = None
 
-    if stream and tiling_config is not None:
+    stream_tiled_output = tiling_config is not None and (
+        stream or (low_memory and not return_video and not save_frames)
+    )
+
+    if (
+        stream_tiled_output
+        and decode_tiling_mode == "spatial"
+        and tiling_config is not None
+        and tiling_config.temporal_config is None
+        and num_frames > 65
+    ):
+        temporal_tile_size = 32 if num_frames > 96 else 64
+        temporal_overlap = 8 if temporal_tile_size == 32 else 24
+        tiling_config = TilingConfig(
+            spatial_config=tiling_config.spatial_config,
+            temporal_config=TemporalTilingConfig(
+                tile_size_in_frames=temporal_tile_size,
+                tile_overlap_in_frames=temporal_overlap,
+            ),
+        )
+
+    if audio:
+        temp_video_path = output_path.with_suffix(".temp.mp4")
+        save_path = temp_video_path
+    else:
+        save_path = output_path
+
+    if stream_tiled_output:
         import cv2
 
         fourcc = cv2.VideoWriter_fourcc(*"avc1")
-        video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        video_writer = cv2.VideoWriter(str(save_path), fourcc, fps, (width, height))
         stream_progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -3293,6 +3526,8 @@ def generate_video(
         stream_task = stream_progress.add_task(
             "[cyan]Streaming frames[/]", total=num_frames
         )
+        if return_video or save_frames:
+            captured_frame_chunks = []
 
         def on_frames_ready(frames: mx.array, _start_idx: int):
             frames = mx.squeeze(frames, axis=0)
@@ -3300,6 +3535,9 @@ def generate_video(
             frames = mx.clip((frames + 1.0) / 2.0, 0.0, 1.0)
             frames = (frames * 255).astype(mx.uint8)
             frames_np = np.array(frames)
+
+            if captured_frame_chunks is not None:
+                captured_frame_chunks.append(frames_np)
 
             for frame in frames_np:
                 video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -3328,11 +3566,13 @@ def generate_video(
             tiling_mode=decode_tiling_mode,
             debug=verbose,
             on_frames_ready=on_frames_ready,
+            return_output=not stream_tiled_output,
         )
     else:
         console.print("[dim]  Tiling: disabled[/]")
         video = vae_decoder(latents)
-    mx.eval(video)
+    if video is not None:
+        mx.eval(video)
     mx.clear_cache()
     memory_profiler.log("video decoded")
 
@@ -3341,24 +3581,18 @@ def generate_video(
         video_writer.release()
         if stream_progress is not None:
             stream_progress.stop()
-        console.print(f"[green]✅ Streamed video to[/] {output_path}")
-        video = mx.squeeze(video, axis=0)
-        video = mx.transpose(video, (1, 2, 3, 0))
-        video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
-        video = (video * 255).astype(mx.uint8)
-        video_np = np.array(video)
+        console.print(f"[green]✅ Streamed video to[/] {save_path}")
+        video_np = (
+            np.concatenate(captured_frame_chunks, axis=0)
+            if captured_frame_chunks is not None and captured_frame_chunks
+            else None
+        )
     else:
         video = mx.squeeze(video, axis=0)
         video = mx.transpose(video, (1, 2, 3, 0))
         video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
         video = (video * 255).astype(mx.uint8)
         video_np = np.array(video)
-
-        if audio:
-            temp_video_path = output_path.with_suffix(".temp.mp4")
-            save_path = temp_video_path
-        else:
-            save_path = output_path
 
         try:
             import cv2
@@ -3625,6 +3859,18 @@ Examples:
         help="Print phase-local MLX memory measurements for profiling/debugging",
     )
     parser.add_argument(
+        "--skip-stage2-refinement",
+        action="store_true",
+        help="Experimental: decode the upsampled Stage 1 result without running Stage 2 refinement",
+    )
+    parser.add_argument(
+        "--stage2-refinement-steps",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3],
+        help="Experimental: override Stage 2 refinement step count for two-stage pipelines (0-3)",
+    )
+    parser.add_argument(
         "--audio",
         "-a",
         action="store_true",
@@ -3764,6 +4010,9 @@ Examples:
         spatial_upscaler=args.spatial_upscaler,
         low_memory=args.low_memory,
         profile_memory=args.profile_memory,
+        skip_stage2_refinement=args.skip_stage2_refinement,
+        stage2_refinement_steps=args.stage2_refinement_steps,
+        return_video=args.save_frames,
     )
 
 

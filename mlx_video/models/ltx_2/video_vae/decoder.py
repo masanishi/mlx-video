@@ -625,7 +625,8 @@ class LTX2VideoDecoder(nn.Module):
         timestep: Optional[mx.array] = None,
         debug: bool = False,
         on_frames_ready: Optional[callable] = None,
-    ) -> mx.array:
+        return_output: bool = True,
+    ) -> Optional[mx.array]:
         """Decode latents using tiling to reduce memory usage.
 
         This method is useful for decoding large videos that would otherwise
@@ -697,6 +698,7 @@ class LTX2VideoDecoder(nn.Module):
             timestep=timestep,
             chunked_conv=use_chunked_conv,
             on_frames_ready=on_frames_ready,
+            return_output=return_output,
         )
 
 

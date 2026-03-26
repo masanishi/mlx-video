@@ -327,7 +327,8 @@ def decode_with_tiling(
     timestep: Optional[mx.array] = None,
     chunked_conv: bool = False,
     on_frames_ready: Optional[Callable[[mx.array, int], None]] = None,
-) -> mx.array:
+    return_output: bool = True,
+) -> Optional[mx.array]:
     """Decode latents using tiling to reduce memory usage.
 
     Args:
@@ -342,9 +343,13 @@ def decode_with_tiling(
         on_frames_ready: Optional callback called with (frames, start_idx) when frames are finalized.
             frames: Tensor of shape (B, 3, num_frames, H, W) with finalized RGB frames.
             start_idx: Starting frame index in the full video.
+        return_output: Whether to return the full decoded tensor. When False and a
+            callback is provided, finalized frame chunks are emitted through the
+            callback and the accumulated decode buffer is released instead of being
+            returned to the caller.
 
     Returns:
-        Decoded video.
+        Decoded video, or None when `return_output=False`.
     """
     import gc
 
@@ -573,7 +578,29 @@ def decode_with_tiling(
                     del finalized_output, finalized_weights
                     gc.collect()
 
-    # Normalize by weights
+    # Normalize by weights. When streaming-only, flush the remainder in chunks to
+    # avoid a final full-tensor normalization spike.
+    if on_frames_ready is not None and not return_output:
+        emitted = getattr(decode_with_tiling, "_emitted_frames", 0)
+        frame_chunk_size = 32
+        for start in range(emitted, out_f, frame_chunk_size):
+            end = min(start + frame_chunk_size, out_f)
+            chunk_weights = mx.maximum(weights[:, :, start:end, :, :], 1e-8)
+            chunk_output = (
+                output[:, :, start:end, :, :] / chunk_weights
+            ).astype(latents.dtype)
+            mx.eval(chunk_output)
+            on_frames_ready(chunk_output, start)
+            del chunk_output, chunk_weights
+            gc.collect()
+
+        if hasattr(decode_with_tiling, "_emitted_frames"):
+            del decode_with_tiling._emitted_frames
+
+        del weights, output
+        gc.collect()
+        return None
+
     weights = mx.maximum(weights, 1e-8)
     output = output / weights
     mx.eval(output)
