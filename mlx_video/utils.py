@@ -10,8 +10,15 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image
 
+from mlx_video.quantization import quantize_modules
+
 
 DEFAULT_MODEL_ALLOW_PATTERNS = ["*.safetensors", "*.json"]
+_QUANTIZATION_MODE_DEFAULTS = {
+    "affine": {"group_size": 64},
+    "mxfp4": {"group_size": 32, "bits": 4},
+    "mxfp8": {"group_size": 32, "bits": 8},
+}
 
 
 def _path_has_required_files(path: Path, required_patterns: list[str]) -> bool:
@@ -100,26 +107,86 @@ def get_model_path(
     return path
 
 
+def normalize_quantization_config(quantization: Optional[dict]) -> Optional[dict]:
+    if quantization is None:
+        return None
+
+    normalized = dict(quantization)
+    mode = normalized.get("mode", "affine")
+    normalized["mode"] = mode
+
+    if mode in _QUANTIZATION_MODE_DEFAULTS:
+        defaults = _QUANTIZATION_MODE_DEFAULTS[mode]
+        if "group_size" in defaults and normalized.get("group_size") is None:
+            normalized["group_size"] = defaults["group_size"]
+        if "bits" in defaults and normalized.get("bits") is None:
+            normalized["bits"] = defaults["bits"]
+    elif "group_size" not in normalized or "bits" not in normalized:
+        raise ValueError(
+            "Quantization config must define bits and group_size for non-default modes."
+        )
+
+    bits = normalized.get("bits")
+    group_size = normalized.get("group_size")
+
+    if bits is None:
+        raise ValueError("Quantization config must define bits.")
+    if group_size is None:
+        raise ValueError("Quantization config must define group_size.")
+
+    if mode == "mxfp4":
+        if bits != 4:
+            raise ValueError("MXFP4 quantization requires bits=4.")
+        if group_size != 32:
+            raise ValueError("MXFP4 quantization requires group_size=32.")
+    elif mode == "mxfp8":
+        if bits != 8:
+            raise ValueError("MXFP8 quantization requires bits=8.")
+        if group_size != 32:
+            raise ValueError("MXFP8 quantization requires group_size=32.")
+
+    if normalized.get("quantize_input") and mode not in ("mxfp8", "nvfp4"):
+        raise ValueError(
+            "Activation quantization is only supported for mxfp8 and nvfp4."
+        )
+
+    return normalized
+
+
+def supports_quantized_weight_shape(module: nn.Module, group_size: int) -> bool:
+    if not hasattr(module, "weight"):
+        return True
+    return module.weight.shape[-1] % group_size == 0
+
+
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
     if quantization is not None:
+        quantization = normalize_quantization_config(quantization)
+        force_quantization = quantization.get("force", False)
+        predicate_override = quantization.get("class_predicate")
 
         def get_class_predicate(p, m):
+            if predicate_override is not None:
+                return predicate_override(p, m)
             # Handle custom per layer quantizations
             if p in quantization:
                 return quantization[p]
             if not hasattr(m, "to_quantized"):
                 return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.shape[0] % 64 != 0:
+            if not supports_quantized_weight_shape(m, quantization["group_size"]):
                 return False
+            # 保存済みの量子化重みがない通常モデルでも、runtime 指定時はここで新規量子化する。
+            if force_quantization:
+                return True
             # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
-        nn.quantize(
+        quantize_modules(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
+            quantize_input=quantization.get("quantize_input", False),
             class_predicate=get_class_predicate,
         )
 

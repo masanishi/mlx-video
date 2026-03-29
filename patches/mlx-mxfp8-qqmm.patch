@@ -1,0 +1,155 @@
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+index c0f1a3c..c4f7705 100644
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -1323,7 +1323,9 @@ void QQMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
+   auto& encoder = cpu::get_command_encoder(stream());
+ 
+   bool w_quantized = (inputs[1].dtype() == uint32);
+-  if (w_quantized && inputs[0].shape(-2) == 1) {
++  bool allow_general_case =
++      (mode_ == QuantizationMode::Mxfp8) || (inputs[0].shape(-2) == 1);
++  if (w_quantized && allow_general_case) {
+     bool donate_x = inputs[0].is_donatable();
+     auto x = ensure_row_contiguous(inputs[0], encoder, stream());
+     auto w = ensure_row_contiguous(inputs[1], encoder, stream());
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index e67001e..8628c78 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1613,7 +1613,9 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+ 
+   auto mode = quantization_mode_to_string(mode_);
+   bool w_quantized = (inputs[1].dtype() == uint32);
+-  if (w_quantized && inputs[0].shape(-2) == 1) {
++  bool allow_general_case =
++      (mode_ == QuantizationMode::Mxfp8) || (inputs[0].shape(-2) == 1);
++  if (w_quantized && allow_general_case) {
+     out.set_data(allocator::malloc(out.nbytes()));
+ 
+     bool donate_x = inputs[0].is_donatable();
+@@ -1629,24 +1631,44 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     array w = ensure_row_contiguous_matrix(inputs[1], d, s);
+     array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+ 
+-    bool non_batched = w.ndim() == 2;
++    bool non_batched = w.ndim() == 2 && xhat.flags().row_contiguous;
+     int K = x.shape(-1);
+     int M = non_batched ? x.size() / K : x.shape(-2);
+     int N = out.shape(-1);
++
++    if (mode_ != QuantizationMode::Mxfp8) {
++      dispatch_qmv(
++          xhat, w, scales, std::nullopt, out, group_size_, bits_, M, N, K, d, s, mode);
++      return;
++    }
++
++    int vector_limit = get_qmv_batch_limit(K, N, d);
++    if (M >= vector_limit) {
++      int B = out.size() / M / N;
++      if (B == 1) {
++        qmm_splitk(
++            xhat, w, scales, std::nullopt, out, group_size_, bits_, M, N, K, d, s, mode);
++        return;
++      }
++      qmm(
++          xhat,
++          w,
++          scales,
++          std::nullopt,
++          out,
++          /* transpose = */ true,
++          group_size_,
++          bits_,
++          M,
++          N,
++          K,
++          d,
++          s,
++          mode);
++      return;
++    }
+     dispatch_qmv(
+-        xhat,
+-        w,
+-        scales,
+-        std::nullopt,
+-        out,
+-        group_size_,
+-        bits_,
+-        M,
+-        N,
+-        K,
+-        d,
+-        s,
+-        mode);
++        xhat, w, scales, std::nullopt, out, group_size_, bits_, M, N, K, d, s, mode);
+     return;
+   } else {
+     throw std::runtime_error("[QQMatmul] NYI for the general case");
+diff --git a/python/tests/test_nn.py b/python/tests/test_nn.py
+index 5957184..8ad8b08 100644
+--- a/python/tests/test_nn.py
++++ b/python/tests/test_nn.py
+@@ -234,6 +234,9 @@ class TestBase(mlx_tests.MLXTestCase):
+         self.assertTrue(isinstance(m.layers[0], nn.Embedding))
+         self.assertTrue(isinstance(m.layers[1], nn.ReLU))
+         self.assertTrue(isinstance(m.layers[2], nn.QQLinear))
++        m.eval()
++        y = m.layers[2](mx.random.normal(shape=(2, 3, 256)))
++        self.assertEqual(y.shape, (2, 3, 256))
+ 
+         # Check that Embedding does not support quantize_input
+         m = nn.Sequential(
+diff --git a/python/tests/test_quantized.py b/python/tests/test_quantized.py
+index a7472e9..9a22c51 100644
+--- a/python/tests/test_quantized.py
++++ b/python/tests/test_quantized.py
+@@ -7,6 +7,14 @@ import mlx.core as mx
+ import mlx_tests
+ 
+ 
++def ulp_bf16_at(x):
++    ax = mx.abs(x)
++    min_normal = mx.array(2.0**-126)
++    ax = mx.where(ax < min_normal, min_normal, ax)
++    e = mx.floor(mx.log2(ax))
++    return mx.power(2.0, e - 7.0)
++
++
+ class TestQuantized(mlx_tests.MLXTestCase):
+     def test_quantize_dequantize(self):
+         w = mx.random.normal(shape=(128, 512))
+@@ -205,6 +213,32 @@ class TestQuantized(mlx_tests.MLXTestCase):
+                     self.assertEqual(y_q.shape, y_hat.shape)
+                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
+ 
++    def test_qqmm_general_case_quantized_weights(self):
++        key = mx.random.key(0)
++        k1, k2 = mx.random.split(key)
++        dtypes = [mx.float32]
++        tests = (
++            (4, 64, 128),
++            (17, 128, 256),
++        )
++        for M, N, K in tests:
++            for mode in ["mxfp8"]:
++                for dtype in dtypes:
++                    with self.subTest(shape=(M, N, K), mode=mode, dtype=dtype):
++                        x = mx.random.normal(shape=(M, K), key=k1, dtype=dtype)
++                        w = mx.random.normal(shape=(N, K), key=k2, dtype=dtype)
++                        w_q, scales = mx.quantize(w, mode=mode)
++                        w_hat = mx.dequantize(w_q, scales, mode=mode, dtype=dtype)
++                        x_hat = mx.dequantize(
++                            *mx.quantize(x, mode=mode), mode=mode, dtype=dtype
++                        )
++                        y_q = mx.qqmm(x, w_q, scales, mode=mode)
++                        y_hat = x_hat @ mx.swapaxes(w_hat, -1, -2)
++                        self.assertEqual(y_q.shape, y_hat.shape)
++                        error = (y_q - y_hat).abs()
++                        ulp = ulp_bf16_at(y_hat)
++                        self.assertTrue(mx.logical_or(error < 1e-3, error <= ulp).all())
++
+     def test_qmm(self):
+         key = mx.random.key(0)
+         k1, k2 = mx.random.split(key)

@@ -11,7 +11,7 @@ description = "MLX-Video is the best package for inference and finetuning of Ima
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mlx>=0.22.0",
+    "mlx>=0.31.1",
     "numpy",
     "safetensors",
     "huggingface_hub",

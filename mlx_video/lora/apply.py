@@ -5,7 +5,10 @@ from typing import Dict, List, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_video.quantization import dequantize_linear_weight, is_quantized_linear_module
+
 from mlx_video.lora.types import LoRAWeights
+from mlx_video.utils import normalize_quantization_config
 
 
 def apply_lora_to_linear(
@@ -201,7 +204,8 @@ def apply_loras_to_weights(
     model_weights: Dict[str, mx.array],
     module_to_loras: Dict[str, List[Tuple[LoRAWeights, float]]],
     verbose: bool = False,
-    quantization_bits: int = 0,
+    quantization: dict | None = None,
+    report: bool = True,
 ) -> Dict[str, mx.array]:
     """Apply LoRAs to model weights.
 
@@ -210,15 +214,17 @@ def apply_loras_to_weights(
         module_to_loras: Dictionary mapping module names to lists of
                         (LoRAWeights, strength) tuples
         verbose: If True, print detailed debug information
-        quantization_bits: If >0, weights are quantized at this bit width.
-                          Quantized layers are dequantized before LoRA application
-                          and re-quantized after.
+        quantization: Optional quantization config containing bits, group_size,
+            and mode. Quantized layers are dequantized before LoRA application
+            and re-quantized after.
+        report: If True, print summary counts.
 
     Returns:
         New state dictionary with LoRA-modified weights
     """
     modified_weights = dict(model_weights)
     model_keys = set(model_weights.keys())
+    quantization = normalize_quantization_config(quantization)
 
     applied_count = 0
     skipped_count = 0
@@ -254,38 +260,48 @@ def apply_loras_to_weights(
         is_quantized = (
             original_weight.dtype == mx.uint32
             and scales_key in modified_weights
-            and biases_key in modified_weights
         )
 
         if is_quantized:
+            if quantization is None:
+                raise ValueError(
+                    "Quantized LoRA weight merging requires a quantization config."
+                )
             scales = modified_weights[scales_key]
-            biases = modified_weights[biases_key]
-            group_size = (original_weight.shape[-1] * 32) // (
-                scales.shape[-1] * quantization_bits
-            )
+            biases = modified_weights.get(biases_key)
+            if quantization["mode"] == "affine" and biases is None:
+                raise ValueError("Affine quantized LoRA weights require stored biases.")
+
             dequantized = mx.dequantize(
                 original_weight,
                 scales,
                 biases,
-                group_size=group_size,
-                bits=quantization_bits,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization["mode"],
             )
-            modified = apply_lora_to_linear(dequantized, loras)
+            modified = apply_lora_to_linear(dequantized.astype(mx.float32), loras)
             # Re-quantize with same parameters
-            new_w, new_scales, new_biases = mx.quantize(
-                modified, group_size=group_size, bits=quantization_bits
+            quantized_values = mx.quantize(
+                modified,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization["mode"],
             )
-            modified_weights[weight_key] = new_w
-            modified_weights[scales_key] = new_scales
-            modified_weights[biases_key] = new_biases
+            modified_weights[weight_key] = quantized_values[0]
+            modified_weights[scales_key] = quantized_values[1]
+            if len(quantized_values) == 3:
+                modified_weights[biases_key] = quantized_values[2]
+            else:
+                modified_weights.pop(biases_key, None)
         else:
             modified_weights[weight_key] = apply_lora_to_linear(original_weight, loras)
 
         applied_count += 1
 
-    if applied_count > 0:
+    if report and applied_count > 0:
         print(f"  ✓ Applied to {applied_count} modules")
-    if skipped_count > 0:
+    if report and skipped_count > 0:
         print(f"  ⚠ Skipped {skipped_count} incompatible modules")
 
     return modified_weights
@@ -294,7 +310,7 @@ def apply_loras_to_weights(
 class LoRALinear(nn.Module):
     """Linear layer with on-the-fly LoRA application.
 
-    Wraps nn.Linear or nn.QuantizedLinear, computing LoRA delta at runtime:
+    Wraps nn.Linear or quantized linear layers, computing LoRA delta at runtime:
       output = base_linear(x) + (x @ lora_A.T @ lora_B.T) * scale * strength
     """
 
@@ -323,7 +339,7 @@ def apply_loras_to_model(
 ) -> int:
     """Apply LoRAs to a model by merging into weights.
 
-    For QuantizedLinear layers: dequantizes to bf16, merges LoRA delta, and
+    For quantized linear layers: dequantizes to bf16, merges LoRA delta, and
     replaces with a regular nn.Linear (no per-step overhead, no re-quantization
     precision loss). Non-LoRA layers stay quantized.
 
@@ -378,15 +394,9 @@ def apply_loras_to_model(
                 print(f"    DEBUG: '{lora_key}' -> '{module_path}' -> module not found")
             continue
 
-        if isinstance(target, nn.QuantizedLinear):
+        if is_quantized_linear_module(target):
             # Dequantize → merge LoRA → replace with bf16 Linear
-            weight = mx.dequantize(
-                target.weight,
-                target.scales,
-                target.biases,
-                group_size=target.group_size,
-                bits=target.bits,
-            )
+            weight = dequantize_linear_weight(target)
             merged = apply_lora_to_linear(weight, loras)
             new_linear = nn.Linear(merged.shape[1], merged.shape[0])
             new_linear.weight = merged

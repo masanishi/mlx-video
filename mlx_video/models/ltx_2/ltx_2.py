@@ -1,8 +1,11 @@
+import gc
+import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from mlx_video.models.ltx_2.adaln import AdaLayerNormSingle
 from mlx_video.models.ltx_2.config import (
@@ -16,7 +19,180 @@ from mlx_video.models.ltx_2.transformer import (
     Modality,
     TransformerArgs,
 )
-from mlx_video.utils import resolve_safetensor_files, to_denoised
+from mlx_video.utils import (
+    apply_quantization,
+    normalize_quantization_config,
+    resolve_safetensor_files,
+    supports_quantized_weight_shape,
+    to_denoised,
+)
+
+
+def _read_safetensor_keys(path: Path) -> Set[str]:
+    """Read safetensors tensor names from the file header without loading arrays."""
+    with open(path, "rb") as f:
+        header_size = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_size))
+    return {key for key in header.keys() if key != "__metadata__"}
+
+
+def _resolve_weight_keys(model_path: Path, weight_files: List[Path]) -> Set[str]:
+    index_files = sorted(model_path.glob("*.safetensors.index.json"))
+    if index_files:
+        with open(index_files[0], "r", encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+        return set(weight_map.keys())
+
+    weight_keys: Set[str] = set()
+    for weight_file in weight_files:
+        weight_keys.update(_read_safetensor_keys(weight_file))
+    return weight_keys
+
+
+def _cast_weight_batch_to_bfloat16(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    return {
+        key: value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
+        for key, value in weights.items()
+    }
+
+
+_LTX_QUANTIZED_LINEAR_SUFFIXES = (
+    ".attn1.to_q",
+    ".attn1.to_k",
+    ".attn1.to_v",
+    ".attn1.to_out",
+    ".attn2.to_q",
+    ".attn2.to_k",
+    ".attn2.to_v",
+    ".attn2.to_out",
+    ".ff.proj_in",
+    ".ff.proj_out",
+    ".audio_attn1.to_q",
+    ".audio_attn1.to_k",
+    ".audio_attn1.to_v",
+    ".audio_attn1.to_out",
+    ".audio_attn2.to_q",
+    ".audio_attn2.to_k",
+    ".audio_attn2.to_v",
+    ".audio_attn2.to_out",
+    ".audio_ff.proj_in",
+    ".audio_ff.proj_out",
+    ".audio_to_video_attn.to_q",
+    ".audio_to_video_attn.to_k",
+    ".audio_to_video_attn.to_v",
+    ".audio_to_video_attn.to_out",
+    ".video_to_audio_attn.to_q",
+    ".video_to_audio_attn.to_k",
+    ".video_to_audio_attn.to_v",
+    ".video_to_audio_attn.to_out",
+)
+
+
+def _ltx_runtime_quantize_predicate(
+    path: str,
+    module: nn.Module,
+    *,
+    group_size: int,
+):
+    if not path.startswith("transformer_blocks."):
+        return False
+    if not hasattr(module, "to_quantized"):
+        return False
+    if not supports_quantized_weight_shape(module, group_size):
+        return False
+    return any(path.endswith(suffix) for suffix in _LTX_QUANTIZED_LINEAR_SUFFIXES)
+
+
+def _get_quantized_weight_prefixes(model: nn.Module) -> Set[str]:
+    params = dict(tree_flatten(model.parameters(), destination={}))
+    return {
+        key.rsplit(".", 1)[0]
+        for key in params
+        if key.endswith(".scales")
+    }
+
+
+def _convert_runtime_quantized_weights(
+    weights: Dict[str, mx.array],
+    quantized_prefixes: Set[str],
+    quantization: dict,
+) -> Dict[str, mx.array]:
+    group_size = quantization["group_size"]
+    bits = quantization["bits"]
+    mode = quantization.get("mode", "affine")
+    converted = {}
+
+    for key, value in weights.items():
+        if not key.endswith(".weight"):
+            converted[key] = value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
+            continue
+
+        prefix = key[: -len(".weight")]
+        if prefix not in quantized_prefixes:
+            converted[key] = value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
+            continue
+
+        quantized_values = mx.quantize(
+            value,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        converted[key] = quantized_values[0]
+        converted[f"{prefix}.scales"] = quantized_values[1]
+        if len(quantized_values) == 3:
+            converted[f"{prefix}.biases"] = quantized_values[2]
+
+    return converted
+
+
+def _load_weight_files_incrementally(
+    model: nn.Module,
+    weight_files: List[Path],
+    *,
+    strict: bool,
+    expected_params: Dict[str, mx.array],
+    batch_converter,
+) -> None:
+    loaded_keys = set()
+    unexpected_keys = set()
+
+    for weight_file in weight_files:
+        shard_weights = mx.load(str(weight_file))
+        sanitized = model.sanitize(shard_weights) if hasattr(model, "sanitize") else shard_weights
+
+        if strict:
+            for key, value in sanitized.items():
+                if key not in expected_params:
+                    unexpected_keys.add(key)
+                    continue
+                if expected_params[key].shape != value.shape:
+                    raise ValueError(
+                        f"Weight shape mismatch for {key}: "
+                        f"expected {expected_params[key].shape}, got {value.shape}"
+                    )
+
+        converted = batch_converter(sanitized)
+        model.load_weights(list(converted.items()), strict=False)
+        loaded_keys.update(key for key in sanitized if key in expected_params)
+
+        del shard_weights, sanitized, converted
+        gc.collect()
+        mx.clear_cache()
+
+    if strict:
+        missing_keys = set(expected_params) - loaded_keys
+        if unexpected_keys or missing_keys:
+            problems = []
+            if unexpected_keys:
+                problems.append(
+                    "unexpected keys: " + ", ".join(sorted(unexpected_keys)[:10])
+                )
+            if missing_keys:
+                problems.append(
+                    "missing keys: " + ", ".join(sorted(missing_keys)[:10])
+                )
+            raise ValueError("Failed to load transformer weights strictly: " + "; ".join(problems))
 
 
 class TransformerArgsPreprocessor:
@@ -664,16 +840,22 @@ class LTXModel(nn.Module):
         return sanitized
 
     @classmethod
-    def from_pretrained(cls, model_path: Path, strict: bool = True) -> "LTXModel":
-        import json
-
+    def from_pretrained(
+        cls,
+        model_path: Path,
+        strict: bool = True,
+        quantization: Optional[dict] = None,
+        weight_preprocessor: Optional[Callable[[Dict[str, mx.array]], Dict[str, mx.array]]] = None,
+    ) -> "LTXModel":
         config_dict = {}
         with open(model_path / "config.json", "r") as f:
             config_dict = json.load(f)
-        config = LTXModelConfig(**config_dict)
+        saved_quantization = normalize_quantization_config(
+            config_dict.pop("quantization", None)
+        )
+        quantization = normalize_quantization_config(quantization)
+        config = LTXModelConfig.from_dict(config_dict)
         model = cls(config)
-
-        weights = {}
 
         weight_files = resolve_safetensor_files(model_path)
         if not weight_files:
@@ -682,17 +864,73 @@ class LTXModel(nn.Module):
                 "The transformer cache may be incomplete."
             )
 
-        for weight_file in weight_files:
-            weights.update(mx.load(str(weight_file)))
+        weight_keys = _resolve_weight_keys(model_path, weight_files)
+        has_quantized_weights = any(key.endswith(".scales") for key in weight_keys)
 
-        sanitized = model.sanitize(weights)
-        sanitized = {
-            k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v
-            for k, v in sanitized.items()
-        }
+        # 日本語概要:
+        # 22B の transformer を一括 dict で抱えるとロード中のピークが跳ねるため、
+        # shard ごとに読み込んでその場で model へ反映する。
+        if has_quantized_weights:
+            apply_quantization(
+                model=model,
+                weights=weight_keys,
+                quantization=saved_quantization or quantization,
+            )
+            expected_params = dict(tree_flatten(model.parameters(), destination={}))
+            _load_weight_files_incrementally(
+                model,
+                weight_files,
+                strict=strict,
+                expected_params=expected_params,
+                batch_converter=lambda batch: _cast_weight_batch_to_bfloat16(
+                    weight_preprocessor(batch) if weight_preprocessor is not None else batch
+                ),
+            )
+        elif quantization is not None:
+            expected_params = dict(tree_flatten(model.parameters(), destination={}))
+            runtime_quantization = {
+                **quantization,
+                "force": True,
+                "class_predicate": lambda path, module: _ltx_runtime_quantize_predicate(
+                    path,
+                    module,
+                    group_size=quantization["group_size"],
+                ),
+            }
+            apply_quantization(
+                model=model,
+                weights={},
+                quantization=runtime_quantization,
+            )
+            quantized_prefixes = _get_quantized_weight_prefixes(model)
+            _load_weight_files_incrementally(
+                model,
+                weight_files,
+                strict=strict,
+                expected_params=expected_params,
+                batch_converter=lambda batch: _convert_runtime_quantized_weights(
+                    weight_preprocessor(batch) if weight_preprocessor is not None else batch,
+                    quantized_prefixes,
+                    runtime_quantization,
+                ),
+            )
+        else:
+            expected_params = dict(tree_flatten(model.parameters(), destination={}))
+            _load_weight_files_incrementally(
+                model,
+                weight_files,
+                strict=strict,
+                expected_params=expected_params,
+                batch_converter=lambda batch: _cast_weight_batch_to_bfloat16(
+                    weight_preprocessor(batch) if weight_preprocessor is not None else batch
+                ),
+            )
 
-        model.load_weights(list(sanitized.items()), strict=strict)
+        # Materialize parameters before the first denoise step so weight loading
+        # does not get fused into the first large inference graph.
         mx.eval(model.parameters())
+        gc.collect()
+        mx.clear_cache()
         model.eval()
         return model
 

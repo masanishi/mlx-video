@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from mlx_video.models.ltx_2.config import LTXModelConfig, LTXRopeType
-from mlx_video.models.ltx_2.rope import precompute_freqs_cis
+from mlx_video.models.ltx_2.rope import apply_rotary_emb, precompute_freqs_cis
 
 
 def create_video_position_grid(
@@ -216,6 +216,58 @@ class TestRoPEPositionPrecision:
         # Output should still be float32
         assert cos_freq.dtype == mx.float32
         assert sin_freq.dtype == mx.float32
+
+
+def test_split_rope_matches_between_flat_and_head_shaped_inputs():
+    positions = create_video_position_grid(1, 2, 2, 3, dtype=mx.float32)
+    cos_freq, sin_freq = precompute_freqs_cis(
+        indices_grid=positions,
+        dim=16,
+        theta=10000.0,
+        max_pos=[20, 2048, 2048],
+        use_middle_indices_grid=True,
+        num_attention_heads=2,
+        rope_type=LTXRopeType.SPLIT,
+        double_precision=True,
+    )
+
+    x_flat = mx.random.normal((1, 12, 16), dtype=mx.float32)
+    x_heads = mx.swapaxes(mx.reshape(x_flat, (1, 12, 2, 8)), 1, 2)
+
+    out_flat = apply_rotary_emb(x_flat, (cos_freq, sin_freq), LTXRopeType.SPLIT)
+    out_heads = apply_rotary_emb(x_heads, (cos_freq, sin_freq), LTXRopeType.SPLIT)
+    out_heads = mx.reshape(mx.swapaxes(out_heads, 1, 2), x_flat.shape)
+    mx.eval(out_flat, out_heads)
+
+    np.testing.assert_allclose(np.array(out_heads), np.array(out_flat), rtol=1e-5, atol=1e-5)
+
+
+def test_interleaved_rope_matches_between_flat_and_head_shaped_inputs():
+    positions = create_video_position_grid(1, 2, 2, 3, dtype=mx.float32)
+    cos_freq, sin_freq = precompute_freqs_cis(
+        indices_grid=positions,
+        dim=12,
+        theta=10000.0,
+        max_pos=[20, 2048, 2048],
+        use_middle_indices_grid=True,
+        num_attention_heads=2,
+        rope_type=LTXRopeType.INTERLEAVED,
+        double_precision=True,
+    )
+
+    x_flat = mx.random.normal((1, 12, 12), dtype=mx.float32)
+    x_heads = mx.swapaxes(mx.reshape(x_flat, (1, 12, 2, 6)), 1, 2)
+
+    out_flat = apply_rotary_emb(
+        x_flat, (cos_freq, sin_freq), LTXRopeType.INTERLEAVED
+    )
+    out_heads = apply_rotary_emb(
+        x_heads, (cos_freq, sin_freq), LTXRopeType.INTERLEAVED
+    )
+    out_heads = mx.reshape(mx.swapaxes(out_heads, 1, 2), x_flat.shape)
+    mx.eval(out_flat, out_heads)
+
+    np.testing.assert_allclose(np.array(out_heads), np.array(out_flat), rtol=1e-5, atol=1e-5)
 
     def test_position_grid_should_be_float32_recommendation(self):
         """Test that validates the recommended practice: positions should be float32.

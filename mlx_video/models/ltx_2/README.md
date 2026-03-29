@@ -21,6 +21,16 @@ Four pipeline types are available via the `--pipeline` flag:
 # Distilled (default) - fast, two-stage
 uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
 
+# Distilled + 8bit transformer (recommended speed/quality tradeoff on LTX-2.3)
+uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --transformer-quantization-bits 8
+
+# Distilled + experimental MXFP8 transformer weights + inputs
+uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --transformer-quantization-bits 8 \
+    --transformer-quantization-mode mxfp8 \
+    --transformer-quantize-inputs
+
 # Dev - single-stage with CFG
 uv run mlx_video.ltx_2.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
 
@@ -169,6 +179,12 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `aggressive`, `conservative` |
 | `--stream` | false | Stream frames as they decode |
 | `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below). Auto-detects x2 by default. |
+| `--transformer-quantization-bits` | None | Runtime-quantize the transformer. `affine` supports 4-bit or 8-bit; `8` is the recommended distilled speed/quality tradeoff. |
+| `--transformer-quantization-mode` | `affine` | Runtime quantization mode: `affine` or experimental `mxfp8` |
+| `--transformer-quantization-group-size` | mode-dependent | Group size used by runtime transformer quantization. Defaults to `64` for `affine`, `32` for `mxfp8` |
+| `--transformer-quantize-inputs` | false | Experimental: quantize transformer activations on the fly. Currently supported with `mxfp8` only |
+| `--preserve-stage2-audio-refinement` | false | Keep Stage 2 audio refinement on even in `--low-memory` mode (higher peak memory, better audio) |
+| `--audio-bitrate` | `320k` | AAC bitrate used when muxing MP4 audio |
 
 ### Spatial Upscalers (LTX-2.3)
 
@@ -195,6 +211,10 @@ uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-disti
 ```
 
 > **Note:** Stage 1 always runs at half the target resolution. With x1.5, the final output is 75% of `--width`/`--height` (e.g., 512 target -> 256 stage 1 -> 384 output). With x2, the output matches the target exactly.
+
+> **Distilled quality note:** The default distilled pipeline keeps its fixed 8-step Stage 1 and 3-step Stage 2 refinement schedule. `--transformer-quantization-bits 8` only changes the transformer precision/storage path; it does **not** reduce the upsampler or the default 3-step Stage 2 refinement.
+
+> **Experimental `mxfp8` note:** `--transformer-quantization-mode mxfp8` supports weight-only quantization by default, and `--transformer-quantize-inputs` adds activation quantization for the targeted transformer linears. Both modes remain hardware/workload dependent and are not guaranteed to beat `affine` 8-bit on every Apple Silicon setup.
 
 ### Dev / Dev-Two-Stage
 
@@ -226,6 +246,8 @@ uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-disti
 ### Distilled / Refinement
 
 When `--lora-path` is passed to the distilled pipeline, the LoRA weights are merged before the stage 2 refinement pass. Auto-detection is intentionally left to the two-stage pipelines only.
+
+For quality-preserving acceleration, the recommended distilled preset is to keep the default `8 + 3` denoising schedule and add `--transformer-quantization-bits 8 --transformer-quantization-mode affine`. `mxfp8` is available as an experimental alternative when you want to test an MLX microscaling weight format, and `--transformer-quantize-inputs` extends it to activation quantization for the targeted transformer linears. For audio-heavy runs, add `--preserve-stage2-audio-refinement` if you also need `--low-memory`, and raise `--audio-bitrate` when you want a higher-quality MP4 mux. Converted model repos already store the spatial upsampler in MLX layout, and the runtime loader now skips the extra sanitize pass for those artifacts.
 
 HQ defaults: 15 steps (vs 30), `cfg-rescale` 0.45 (vs 0.7), STG disabled. Uses the res_2s second-order sampler (2 model evals per step) for better quality at the same compute budget.
 

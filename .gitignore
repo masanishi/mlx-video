@@ -11,6 +11,7 @@ __pycache__/*
 .venv/
 .pytest_cache/
 .tmp_*.py
+.mlx-build/
 
 # Generated local outputs
 *.mp4

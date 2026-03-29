@@ -276,7 +276,7 @@ def load_and_apply_loras(
     model_weights: Dict[str, mx.array],
     lora_configs: Optional[List[Tuple[str, float]]] = None,
     verbose: bool = False,
-    quantization_bits: int = 0,
+    quantization: Optional[dict] = None,
 ) -> Dict[str, mx.array]:
     """Load and apply LoRA weights to model weights by merging into weight dict.
 
@@ -302,7 +302,7 @@ def load_and_apply_loras(
         model_weights,
         module_to_loras,
         verbose=verbose,
-        quantization_bits=quantization_bits,
+        quantization=quantization,
     )
 
     print(f"{Colors.GREEN}✓ LoRAs applied successfully{Colors.RESET}")

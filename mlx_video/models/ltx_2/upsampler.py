@@ -1,7 +1,95 @@
-from typing import Tuple, Union
+from typing import Dict, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+def _transpose_conv3d_weight_if_needed(value: mx.array) -> mx.array:
+    """Convert PyTorch Conv3d weights to MLX layout when needed.
+
+    PyTorch stores Conv3d weights as ``(O, I, D, H, W)`` while MLX expects
+    ``(O, D, H, W, I)``. The check is intentionally idempotent so that already
+    converted MLX weights can pass through unchanged.
+    """
+    if value.ndim != 5:
+        return value
+
+    if value.shape[1] > value.shape[-1]:
+        return mx.transpose(value, (0, 2, 3, 4, 1))
+
+    return value
+
+
+def _transpose_conv2d_weight_if_needed(key: str, value: mx.array) -> mx.array:
+    """Convert PyTorch Conv2d-style weights to MLX layout when needed.
+
+    This handles both normal Conv2d weights and the blur kernel used by the
+    x1.5 rational resampler. The transformation is idempotent for already
+    converted MLX weights.
+    """
+    if value.ndim != 4:
+        return value
+
+    if key.endswith("kernel"):
+        if value.shape[1] == 1 and value.shape[-1] != 1:
+            return mx.transpose(value, (0, 2, 3, 1))
+        return value
+
+    if value.shape[1] > value.shape[-1]:
+        return mx.transpose(value, (0, 2, 3, 1))
+
+    return value
+
+
+def sanitize_upsampler_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Normalize upsampler weights for MLX loading and offline conversion.
+
+    The returned dictionary is compatible with ``LatentUpsampler.load_weights``
+    and is safe to call on either raw PyTorch-layout safetensors or already
+    converted MLX-layout safetensors.
+    """
+    sanitized = {}
+
+    for key, value in weights.items():
+        new_key = key
+
+        if key.startswith("upsampler.0."):
+            new_key = key.replace("upsampler.0.", "upsampler.conv.")
+
+        if "weight" in new_key and value.ndim == 5:
+            value = _transpose_conv3d_weight_if_needed(value)
+
+        if ("weight" in new_key or new_key.endswith("kernel")) and value.ndim == 4:
+            value = _transpose_conv2d_weight_if_needed(new_key, value)
+
+        sanitized[new_key] = value
+
+    return sanitized
+
+
+def upsampler_weights_need_sanitization(weights: Dict[str, mx.array]) -> bool:
+    """Return whether loaded upsampler weights still need PyTorch→MLX cleanup.
+
+    Pre-converted model repos already store the upsampler in MLX layout, so the
+    runtime path can skip the extra sanitize/transposition pass for those files.
+    """
+    for key, value in weights.items():
+        if key.startswith("upsampler.0."):
+            return True
+
+        if "weight" in key and value.ndim == 5:
+            if value.shape[1] > value.shape[-1]:
+                return True
+            continue
+
+        if ("weight" in key or key.endswith("kernel")) and value.ndim == 4:
+            if key.endswith("kernel"):
+                if value.shape[1] == 1 and value.shape[-1] != 1:
+                    return True
+            elif value.shape[1] > value.shape[-1]:
+                return True
+
+    return False
 
 
 class Conv3d(nn.Module):
@@ -413,25 +501,28 @@ def load_upsampler(weights_path: str) -> Tuple[LatentUpsampler, float]:
     """
     print(f"Loading spatial upsampler from {weights_path}...")
     raw_weights = mx.load(weights_path)
+    if upsampler_weights_need_sanitization(raw_weights):
+        print("  Detected raw PyTorch-layout weights; sanitizing for MLX...")
+        weights = sanitize_upsampler_weights(raw_weights)
+    else:
+        print("  Detected MLX-layout weights; skipping runtime sanitize")
+        weights = raw_weights
 
     # Detect mid_channels from res_blocks
     sample_key = "res_blocks.0.conv1.weight"
-    if sample_key in raw_weights:
-        mid_channels = raw_weights[sample_key].shape[0]
+    if sample_key in weights:
+        mid_channels = weights[sample_key].shape[0]
     else:
-        mid_channels = 1024
+        conv_key = "upsampler.conv.weight"
+        mid_channels = weights[conv_key].shape[-1] if conv_key in weights else 1024
 
     # Detect upsampler type from conv output channels
     # x2: conv out = 4 * mid (2^2 * mid for PixelShuffle(2))
     # x1.5: conv out = 9 * mid (3^2 * mid for PixelShuffle(3)) + blur downsample
     # Both formats may have upsampler.blur_down.kernel, so use channel count
-    conv_key = (
-        "upsampler.conv.weight"
-        if "upsampler.conv.weight" in raw_weights
-        else "upsampler.0.weight"
-    )
-    if conv_key in raw_weights:
-        out_channels = raw_weights[conv_key].shape[0]
+    conv_key = "upsampler.conv.weight"
+    if conv_key in weights:
+        out_channels = weights[conv_key].shape[0]
         ratio = out_channels // mid_channels
         rational_resampler = ratio == 9  # 3^2 for PixelShuffle(3) + blur downsample
         spatial_scale = 1.5 if rational_resampler else 2.0
@@ -452,28 +543,9 @@ def load_upsampler(weights_path: str) -> Tuple[LatentUpsampler, float]:
         rational_resampler=rational_resampler,
     )
 
-    # Sanitize weights - convert from PyTorch to MLX format
-    sanitized = {}
-    for key, value in raw_weights.items():
-        new_key = key
-
-        # x2 upsampler uses sequential indexing: upsampler.0.* -> upsampler.conv.*
-        if key.startswith("upsampler.0."):
-            new_key = key.replace("upsampler.0.", "upsampler.conv.")
-
-        # Conv3d weights: PyTorch (O, I, D, H, W) -> MLX (O, D, H, W, I)
-        if "weight" in new_key and value.ndim == 5:
-            value = mx.transpose(value, (0, 2, 3, 4, 1))
-
-        # Conv2d weights: PyTorch (O, I, H, W) -> MLX (O, H, W, I)
-        if ("weight" in new_key or "kernel" in new_key) and value.ndim == 4:
-            value = mx.transpose(value, (0, 2, 3, 1))
-
-        sanitized[new_key] = value
-
     # Load weights
-    upsampler.load_weights(list(sanitized.items()), strict=False)
+    upsampler.load_weights(list(weights.items()), strict=False)
 
-    print(f"  Loaded {len(sanitized)} weights")
+    print(f"  Loaded {len(weights)} weights")
 
     return upsampler, spatial_scale

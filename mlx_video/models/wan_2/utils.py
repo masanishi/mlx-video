@@ -32,6 +32,7 @@ def load_wan_model(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=lambda path, m: _quantize_predicate(path, m),
         )
 

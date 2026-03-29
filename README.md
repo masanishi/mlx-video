@@ -14,6 +14,13 @@ pip install git+https://github.com/Blaizzy/mlx-video.git
 uv pip install git+https://github.com/Blaizzy/mlx-video.git
 ```
 
+### Option 3: Install the patched MLX build for `mxfp8` activation quantization
+```bash
+./scripts/install_mlx_mxfp8_qqmm.sh
+```
+
+This script clones a known-good MLX commit, applies the local `qqmm` patch for `mxfp8`, and installs it into this repo's `.venv`. After that, use `uv run --no-sync ...` or call `.venv/bin/mlx_video.ltx_2.generate` directly. Plain `uv run ...` will resync `uv.lock` and replace the patched MLX build.
+
 ## Supported Models
 
 - [**LTX-2**](https://huggingface.co/Lightricks/LTX-Video) — 19B parameter video generation model from Lightricks
@@ -48,6 +55,16 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 # Text-to-Video (distilled, fastest)
 uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
 
+# Text-to-Video (distilled + 8bit transformer, recommended for large LTX-2.3 runs)
+uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --transformer-quantization-bits 8
+
+# Text-to-Video (distilled + experimental MXFP8 transformer weights + inputs)
+uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --transformer-quantization-bits 8 \
+    --transformer-quantization-mode mxfp8 \
+    --transformer-quantize-inputs
+
 # Image-to-Video (aspect ratio preserved via letterbox)
 uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg
 
@@ -67,6 +84,10 @@ uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
 ```
 
 By default, `uv run mlx_video.ltx_2.generate` now uses `prince-canuma/LTX-2.3-distilled`. If that repo does not include an embedded text encoder, the CLI automatically resolves `google/gemma-3-12b-it` unless you pass `--text-encoder-repo` explicitly.
+
+For `distilled`, the quality-preserving default remains the fixed `8 + 3` schedule. Adding `--transformer-quantization-bits 8 --transformer-quantization-mode affine` only changes transformer weight storage/compute; it does **not** reduce the default 3-step Stage 2 refinement. Experimental `mxfp8` support is also available, and `--transformer-quantize-inputs` extends it from weight-only quantization to activation quantization for the targeted transformer linears. Speedups remain hardware- and workload-dependent. For audio-heavy low-memory runs, `--preserve-stage2-audio-refinement` keeps the second-pass audio update on at the cost of higher peak memory.
+
+If you want `--transformer-quantize-inputs` to stay enabled, install the patched MLX build with `./scripts/install_mlx_mxfp8_qqmm.sh` and run generation with `uv run --no-sync ...`. Plain `uv run ...` will restore the stock `mlx==0.31.1` from `uv.lock` and activation quantization will fall back to weight-only mode.
 
 ### LoRA Support (LTX-2.3)
 
@@ -91,7 +112,7 @@ uv run mlx_video.ltx_2.generate \
     --pipeline dev-two-stage-hq \
     --model-repo prince-canuma/LTX-2.3-dev \
     --prompt "A fashion film shot with elegant camera movement" \
-    --lora-path /Users/masatonishihara/Documents/ComfyUI/models/loras/ltx-2.3-distilled-lora.safetensors \
+    --lora-path /path/to/ltx-2.3-distilled-lora.safetensors \
     --lora-strength-stage-1 0.25 \
     --lora-strength-stage-2 0.5
 ```
@@ -124,6 +145,12 @@ Pre-converted weights are available on HuggingFace ([LTX-2-distilled](https://hu
 | `--audio`, `-a` | false | Enable synchronized audio generation |
 | `--audio-file` | None | Path to audio file for A2V conditioning |
 | `--output-audio` | None | Optional output path for decoded audio |
+| `--transformer-quantization-bits` | None | Runtime-quantize the LTX transformer. `affine` supports 4-bit or 8-bit; `8` is the recommended distilled speed/quality tradeoff |
+| `--transformer-quantization-mode` | `affine` | Runtime quantization mode: `affine` or experimental `mxfp8` |
+| `--transformer-quantization-group-size` | mode-dependent | Group size used by runtime transformer quantization. Defaults to `64` for `affine`, `32` for `mxfp8` |
+| `--transformer-quantize-inputs` | false | Experimental: quantize transformer activations on the fly. Currently supported with `mxfp8` only |
+| `--preserve-stage2-audio-refinement` | false | Keep Stage 2 audio refinement on even in `--low-memory` mode (higher peak memory, better audio) |
+| `--audio-bitrate` | `320k` | AAC bitrate used when muxing MP4 audio |
 | `--lora-path` | None | Path to a LoRA safetensors file for `distilled` / `dev-two-stage` / `dev-two-stage-hq`; auto-detected from the model repo for the two-stage pipelines when omitted |
 | `--lora-strength` | 1.0 | LoRA merge strength for `--pipeline distilled` / `dev-two-stage` |
 | `--lora-strength-stage-1` | 0.25 | Stage 1 LoRA strength for `--pipeline dev-two-stage-hq` |
@@ -230,7 +257,7 @@ python -m mlx_video.wan_2.generate \
 
 - macOS with Apple Silicon
 - Python >= 3.11
-- MLX >= 0.22.0
+- MLX >= 0.31.1
 - For weight conversion: PyTorch (`pip install torch`)
 
 ## License

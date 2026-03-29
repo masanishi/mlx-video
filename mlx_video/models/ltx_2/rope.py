@@ -53,6 +53,13 @@ def apply_interleaved_rotary_emb(
     cos_freqs = cos_freqs.astype(mx.float32)
     sin_freqs = sin_freqs.astype(mx.float32)
 
+    if input_tensor.ndim == 4 and cos_freqs.ndim == 3:
+        b, heads, seq_len, dim_head = input_tensor.shape
+        cos_freqs = mx.reshape(cos_freqs, (b, seq_len, heads, dim_head))
+        sin_freqs = mx.reshape(sin_freqs, (b, seq_len, heads, dim_head))
+        cos_freqs = mx.swapaxes(cos_freqs, 1, 2)
+        sin_freqs = mx.swapaxes(sin_freqs, 1, 2)
+
     # Reshape to pair adjacent dimensions: (..., dim) -> (..., dim/2, 2)
     shape = input_tensor.shape
     input_tensor = mx.reshape(input_tensor, shape[:-1] + (shape[-1] // 2, 2))

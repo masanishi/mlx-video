@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Dict
 
 import mlx.core as mx
+from mlx_video.models.ltx_2.upsampler import sanitize_upsampler_weights
 
 # ─── Key prefix routing ──────────────────────────────────────────────────────
 
@@ -759,17 +760,22 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
 
         local_candidate = source_dir / upscaler_file
         if local_candidate.is_file():
-            shutil.copy2(str(local_candidate), str(dest))
-            print(f"  {upscaler_file}: copied")
+            upscaler_source = local_candidate
         elif is_hf_repo:
             from huggingface_hub import hf_hub_download
 
             print(f"  {upscaler_file}: downloading from {source}...")
-            downloaded = hf_hub_download(repo_id=source, filename=upscaler_file)
-            shutil.copy2(downloaded, str(dest))
-            print(f"  {upscaler_file}: done")
+            upscaler_source = Path(
+                hf_hub_download(repo_id=source, filename=upscaler_file)
+            )
         else:
             print(f"  {upscaler_file}: not found, skipping")
+            continue
+
+        upscaler_weights = mx.load(str(upscaler_source))
+        sanitized_upscaler = sanitize_upsampler_weights(upscaler_weights)
+        mx.save_safetensors(str(dest), sanitized_upscaler)
+        print(f"  {upscaler_file}: converted to MLX layout")
 
     # Link text_encoder and tokenizer directories
     print("\nLinking text encoder & tokenizer...")

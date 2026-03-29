@@ -90,6 +90,32 @@ def scaled_dot_product_attention(
     return out
 
 
+def _reshape_to_heads(x: mx.array, heads: int) -> mx.array:
+    """Reshape ``(B, T, H*D)`` into ``(B, H, T, D)`` for RoPE/SDPA."""
+    b, seq_len, dim = x.shape
+    dim_head = dim // heads
+    x = mx.reshape(x, (b, seq_len, heads, dim_head))
+    return mx.swapaxes(x, 1, 2)
+
+
+def _flatten_from_heads(x: mx.array) -> mx.array:
+    """Flatten ``(B, H, T, D)`` back into ``(B, T, H*D)``."""
+    b, heads, seq_len, dim_head = x.shape
+    x = mx.swapaxes(x, 1, 2)
+    return mx.reshape(x, (b, seq_len, heads * dim_head))
+
+
+def _prepare_attention_mask(mask: Optional[mx.array]) -> Optional[mx.array]:
+    """Broadcast masks to ``(B, H, T_q, T_k)`` compatible ranks."""
+    if mask is None:
+        return None
+    if mask.ndim == 2:
+        mask = mx.expand_dims(mask, axis=0)
+    if mask.ndim == 3:
+        mask = mx.expand_dims(mask, axis=1)
+    return mask
+
+
 class Attention(nn.Module):
     """Multi-head attention with rotary position embeddings.
 
@@ -175,19 +201,23 @@ class Attention(nn.Module):
             and self.query_chunk_size > 0
             and x.shape[1] > self.query_chunk_size
         ):
-            k = self.to_k(context)
-            k = self.k_norm(k)
+            v = self.to_v(context)
+            k = self.k_norm(self.to_k(context))
+            k = _reshape_to_heads(k, self.heads)
+            v = _reshape_to_heads(v, self.heads)
 
             if pe is not None:
                 k_pe_to_use = pe if k_pe is None else k_pe
                 k = apply_rotary_emb(k, k_pe_to_use, self.rope_type)
 
+            mask = _prepare_attention_mask(mask)
+            scale = 1.0 / math.sqrt(self.dim_head)
             out_chunks = []
             for start in range(0, x.shape[1], self.query_chunk_size):
                 end = min(start + self.query_chunk_size, x.shape[1])
                 x_chunk = x[:, start:end, :]
-                q_chunk = self.to_q(x_chunk)
-                q_chunk = self.q_norm(q_chunk)
+                q_chunk = self.q_norm(self.to_q(x_chunk))
+                q_chunk = _reshape_to_heads(q_chunk, self.heads)
 
                 if pe is not None:
                     q_chunk = apply_rotary_emb(
@@ -200,24 +230,20 @@ class Attention(nn.Module):
                 if mask is not None and mask.ndim >= 4 and mask.shape[-2] == x.shape[1]:
                     mask_chunk = mask[..., start:end, :]
 
-                out_chunk = scaled_dot_product_attention(
+                out_chunk = mx.fast.scaled_dot_product_attention(
                     q_chunk,
                     k,
                     v,
-                    self.heads,
-                    mask_chunk,
+                    scale=scale,
+                    mask=mask_chunk,
                 )
 
                 if hasattr(self, "to_gate_logits"):
                     gate_chunk = 2.0 * mx.sigmoid(self.to_gate_logits(x_chunk))
-                    b, seq_len, _ = out_chunk.shape
-                    out_chunk = mx.reshape(
-                        out_chunk, (b, seq_len, self.heads, self.dim_head)
-                    )
-                    out_chunk = out_chunk * gate_chunk[..., None]
-                    out_chunk = mx.reshape(out_chunk, (b, seq_len, -1))
+                    gate_chunk = mx.swapaxes(gate_chunk, 1, 2)[..., None]
+                    out_chunk = out_chunk * gate_chunk
 
-                out_chunks.append(self.to_out(out_chunk))
+                out_chunks.append(self.to_out(_flatten_from_heads(out_chunk)))
 
             return mx.concatenate(out_chunks, axis=1)
         else:
@@ -227,32 +253,31 @@ class Attention(nn.Module):
                 gate = 2.0 * mx.sigmoid(self.to_gate_logits(x))  # (B, seq, heads)
 
             # Standard attention
-            q = self.to_q(x)
-            k = self.to_k(context)
+            q = self.q_norm(self.to_q(x))
+            k = self.k_norm(self.to_k(context))
+            v = self.to_v(context)
 
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            q = _reshape_to_heads(q, self.heads)
+            k = _reshape_to_heads(k, self.heads)
+            v = _reshape_to_heads(v, self.heads)
 
             if pe is not None:
                 q = apply_rotary_emb(q, pe, self.rope_type)
                 k_pe_to_use = pe if k_pe is None else k_pe
                 k = apply_rotary_emb(k, k_pe_to_use, self.rope_type)
 
-            out = scaled_dot_product_attention(
+            out = mx.fast.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                self.heads,
-                mask,
-                query_chunk_size=self.query_chunk_size,
+                scale=1.0 / math.sqrt(self.dim_head),
+                mask=_prepare_attention_mask(mask),
             )
 
             # Apply per-head gating
             if gate is not None:
-                b, seq_len, _ = out.shape
-                out = mx.reshape(out, (b, seq_len, self.heads, self.dim_head))
-                out = out * gate[..., None]
-                out = mx.reshape(out, (b, seq_len, -1))
+                gate = mx.swapaxes(gate, 1, 2)[..., None]
+                out = out * gate
 
             # Project output
-            return self.to_out(out)
+            return self.to_out(_flatten_from_heads(out))

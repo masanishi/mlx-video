@@ -7,6 +7,8 @@ import pytest
 from mlx_video.models.ltx_2.video_vae.sampling import DepthToSpaceUpsample
 from mlx_video.models.ltx_2.video_vae.tiling import (
     TilingConfig,
+    SpatialTilingConfig,
+    TemporalTilingConfig,
     compute_trapezoidal_mask_1d,
     decode_with_tiling,
 )
@@ -242,6 +244,85 @@ class TestProgressiveFrameSaving:
         expected_frames = 1 + (5 - 1) * 8
         assert output is None
         assert all_frame_indices == set(range(expected_frames))
+
+    def test_streaming_decode_avoids_full_video_buffer_allocation(self, monkeypatch):
+        """Verify streaming tiled decode keeps its active buffer smaller than the full output."""
+        allocations = []
+        original_zeros = mx.zeros
+
+        def recording_zeros(shape, *args, **kwargs):
+            if isinstance(shape, tuple):
+                allocations.append(shape)
+            return original_zeros(shape, *args, **kwargs)
+
+        def mock_decoder(
+            x, causal=False, timestep=None, debug=False, chunked_conv=False
+        ):
+            b, c, f, h, w = x.shape
+            out_f = 1 + (f - 1) * 8
+            out_h = h * 32
+            out_w = w * 32
+            return mx.zeros((b, 3, out_f, out_h, out_w))
+
+        tiling_config = TilingConfig.temporal_only(tile_size=32, overlap=8)
+        latents = mx.zeros((1, 128, 12, 4, 4))
+
+        monkeypatch.setattr(
+            "mlx_video.models.ltx_2.video_vae.tiling.mx.zeros", recording_zeros
+        )
+
+        output = decode_with_tiling(
+            decoder_fn=mock_decoder,
+            latents=latents,
+            tiling_config=tiling_config,
+            spatial_scale=32,
+            temporal_scale=8,
+            on_frames_ready=lambda *_args: None,
+            return_output=False,
+        )
+
+        # The full output would be 89 frames; the streaming path should never
+        # allocate a buffer that large via mx.zeros.
+        assert output is None
+        assert not any(shape[2] == 89 for shape in allocations if len(shape) == 5)
+
+    def test_streaming_decode_emits_small_chunks_for_progress(self):
+        """Verify finalized frames are emitted in small chunks instead of one large burst."""
+        chunk_sizes = []
+
+        def on_frames_ready(frames: mx.array, start_idx: int):
+            chunk_sizes.append(frames.shape[2])
+
+        def mock_decoder(
+            x, causal=False, timestep=None, debug=False, chunked_conv=False
+        ):
+            b, c, f, h, w = x.shape
+            return mx.zeros((b, 3, f, h, w))
+
+        config = TilingConfig(
+            spatial_config=SpatialTilingConfig(
+                tile_size_in_pixels=768, tile_overlap_in_pixels=64
+            ),
+            temporal_config=TemporalTilingConfig(
+                tile_size_in_frames=64, tile_overlap_in_frames=24
+            ),
+        )
+        latents = mx.zeros((1, 1, 121, 1, 1))
+
+        output = decode_with_tiling(
+            decoder_fn=mock_decoder,
+            latents=latents,
+            tiling_config=config,
+            spatial_scale=1,
+            temporal_scale=1,
+            on_frames_ready=on_frames_ready,
+            return_output=False,
+        )
+
+        assert output is None
+        assert chunk_sizes
+        assert max(chunk_sizes) <= 16
+        assert len(chunk_sizes) >= 8
 
 
 class TestAutoChunkedConv:

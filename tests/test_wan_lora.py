@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 
@@ -325,6 +326,121 @@ class TestApplyLoRA:
             result["blocks.0.self_attn.k.weight"],
             model_weights["blocks.0.self_attn.k.weight"],
         ).item()
+
+    def test_apply_loras_to_weights_handles_mxfp4_without_biases(self):
+        from mlx_video.lora.apply import apply_loras_to_weights
+        from mlx_video.lora.types import LoRAWeights
+
+        quantized = nn.Linear(64, 128, bias=False).to_quantized(
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        mx.eval(quantized.parameters())
+        model_weights = {
+            "blocks.0.self_attn.q.weight": quantized.weight,
+            "blocks.0.self_attn.q.scales": quantized.scales,
+        }
+        w = LoRAWeights(
+            lora_A=mx.ones((4, 64), dtype=mx.float32) * 0.01,
+            lora_B=mx.ones((128, 4), dtype=mx.float32) * 0.01,
+            rank=4,
+            alpha=4.0,
+            module_name="blocks.0.self_attn.q",
+        )
+        result = apply_loras_to_weights(
+            model_weights,
+            {"blocks.0.self_attn.q": [(w, 1.0)]},
+            quantization={"bits": 4, "group_size": 32, "mode": "mxfp4"},
+        )
+
+        assert result["blocks.0.self_attn.q.weight"].dtype == mx.uint32
+        assert "blocks.0.self_attn.q.scales" in result
+        assert "blocks.0.self_attn.q.biases" not in result
+
+    def test_apply_loras_to_weights_merges_mxfp8_in_float32(self, monkeypatch):
+        from mlx_video.lora.apply import apply_loras_to_weights
+        from mlx_video.lora.types import LoRAWeights
+
+        quantized = nn.Linear(64, 128, bias=False).to_quantized(
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+        )
+        mx.eval(quantized.parameters())
+        model_weights = {
+            "blocks.0.self_attn.q.weight": quantized.weight,
+            "blocks.0.self_attn.q.scales": quantized.scales,
+        }
+        w = LoRAWeights(
+            lora_A=mx.ones((4, 64), dtype=mx.float32) * 0.01,
+            lora_B=mx.ones((128, 4), dtype=mx.float32) * 0.01,
+            rank=4,
+            alpha=4.0,
+            module_name="blocks.0.self_attn.q",
+        )
+
+        captured = {}
+        original_quantize = mx.quantize
+
+        def capture_quantize(weight, *args, **kwargs):
+            if kwargs.get("mode") == "mxfp8":
+                captured["dtype"] = weight.dtype
+            return original_quantize(weight, *args, **kwargs)
+
+        monkeypatch.setattr(mx, "quantize", capture_quantize)
+
+        result = apply_loras_to_weights(
+            model_weights,
+            {"blocks.0.self_attn.q": [(w, 1.0)]},
+            quantization={"bits": 8, "group_size": 32, "mode": "mxfp8"},
+        )
+
+        assert result["blocks.0.self_attn.q.weight"].dtype == mx.uint32
+        assert "blocks.0.self_attn.q.scales" in result
+        assert "blocks.0.self_attn.q.biases" not in result
+        assert captured["dtype"] == mx.float32
+
+    def test_apply_loras_to_model_handles_mxfp8_input_quantized_linear(
+        self, monkeypatch
+    ):
+        from mlx_video.lora import apply_loras_to_model
+        from mlx_video.lora.types import LoRAWeights
+        from mlx_video.quantization import QQLinearWithBias, quantize_modules
+
+        monkeypatch.setattr(
+            "mlx_video.quantization.activation_quantized_matmul_supported",
+            lambda mode: mode == "mxfp8",
+        )
+
+        class _TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(64, 128, bias=True)
+
+        model = _TinyModel()
+        quantize_modules(
+            model,
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+            quantize_input=True,
+            class_predicate=lambda path, module: path == "proj",
+        )
+        assert isinstance(model.proj, QQLinearWithBias)
+
+        lora = LoRAWeights(
+            lora_A=mx.ones((4, 64), dtype=mx.float32) * 0.01,
+            lora_B=mx.ones((128, 4), dtype=mx.float32) * 0.01,
+            rank=4,
+            alpha=4.0,
+            module_name="proj",
+        )
+
+        applied = apply_loras_to_model(model, {"proj": [(lora, 1.0)]})
+
+        assert applied == 1
+        assert isinstance(model.proj, nn.Linear)
 
 
 class TestEndToEnd:

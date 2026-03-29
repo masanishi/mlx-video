@@ -109,6 +109,17 @@ def test_resolve_attention_query_chunk_size_uses_small_chunk_for_large_inputs():
     )
 
 
+def test_resolve_attention_query_chunk_size_prefers_memory_for_stage2_even_without_low_memory():
+    assert (
+        resolve_attention_query_chunk_size(
+            low_memory=False,
+            num_tokens=20_000,
+            prefer_memory=True,
+        )
+        == 4_096
+    )
+
+
 def test_resolve_stage2_sigma_schedule_for_one_step():
     assert resolve_stage2_sigma_schedule(1) == [0.909375, 0.0]
 

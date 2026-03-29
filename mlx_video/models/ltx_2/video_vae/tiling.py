@@ -389,6 +389,222 @@ def decode_with_tiling(
     num_w_tiles = len(width_intervals.starts)
     total_tiles = num_t_tiles * num_h_tiles * num_w_tiles
 
+    streaming_output_only = on_frames_ready is not None and not return_output
+
+    if streaming_output_only:
+        import gc
+
+        frame_chunk_size = 16
+        active_output = None
+        active_weights = None
+        active_start = 0
+        active_end = 0
+        tile_idx = 0
+
+        def ensure_window(start: int, end: int) -> None:
+            nonlocal active_output, active_weights, active_start, active_end
+
+            if active_output is None:
+                active_start = start
+                active_end = end
+                active_output = mx.zeros((b, 3, end - start, out_h, out_w), dtype=mx.float32)
+                active_weights = mx.zeros((b, 1, end - start, out_h, out_w), dtype=mx.float32)
+                mx.eval(active_output, active_weights)
+                return
+
+            if end > active_end:
+                extra = end - active_end
+                active_output = mx.concatenate(
+                    [
+                        active_output,
+                        mx.zeros((b, 3, extra, out_h, out_w), dtype=mx.float32),
+                    ],
+                    axis=2,
+                )
+                active_weights = mx.concatenate(
+                    [
+                        active_weights,
+                        mx.zeros((b, 1, extra, out_h, out_w), dtype=mx.float32),
+                    ],
+                    axis=2,
+                )
+                active_end = end
+                mx.eval(active_output, active_weights)
+
+        def emit_ready_frames(limit_end: int) -> None:
+            """Emit finalized frames in small chunks and release them promptly."""
+            nonlocal active_output, active_weights, active_start, active_end
+
+            while active_output is not None and active_start < limit_end:
+                emit_len = min(frame_chunk_size, limit_end - active_start)
+                chunk_weights = mx.maximum(
+                    active_weights[:, :, :emit_len, :, :], 1e-8
+                )
+                chunk_output = (
+                    active_output[:, :, :emit_len, :, :] / chunk_weights
+                ).astype(latents.dtype)
+                mx.eval(chunk_output)
+                on_frames_ready(chunk_output, active_start)
+                del chunk_output, chunk_weights
+
+                if emit_len == active_output.shape[2]:
+                    active_start += emit_len
+                    active_output = None
+                    active_weights = None
+                    active_end = active_start
+                    break
+
+                active_output = active_output[:, :, emit_len:, :, :]
+                active_weights = active_weights[:, :, emit_len:, :, :]
+                active_start += emit_len
+                active_end = active_start + active_output.shape[2]
+                mx.eval(active_output, active_weights)
+
+        for t_idx in range(num_t_tiles):
+            t_start = temporal_intervals.starts[t_idx]
+            t_end = temporal_intervals.ends[t_idx]
+            t_left = temporal_intervals.left_ramps[t_idx]
+            t_right = temporal_intervals.right_ramps[t_idx]
+
+            # Map temporal coordinates
+            out_t_slice, t_mask = map_temporal_slice(
+                t_start, t_end, t_left, t_right, temporal_scale
+            )
+
+            ensure_window(out_t_slice.start, out_t_slice.stop)
+
+            for h_idx in range(num_h_tiles):
+                h_start = height_intervals.starts[h_idx]
+                h_end = height_intervals.ends[h_idx]
+                h_left = height_intervals.left_ramps[h_idx]
+                h_right = height_intervals.right_ramps[h_idx]
+
+                # Map height coordinates
+                out_h_slice, h_mask = map_spatial_slice(
+                    h_start, h_end, h_left, h_right, spatial_scale
+                )
+
+                for w_idx in range(num_w_tiles):
+                    w_start = width_intervals.starts[w_idx]
+                    w_end = width_intervals.ends[w_idx]
+                    w_left = width_intervals.left_ramps[w_idx]
+                    w_right = width_intervals.right_ramps[w_idx]
+
+                    # Map width coordinates
+                    out_w_slice, w_mask = map_spatial_slice(
+                        w_start, w_end, w_left, w_right, spatial_scale
+                    )
+
+                    tile_latents = latents[
+                        :, :, t_start:t_end, h_start:h_end, w_start:w_end
+                    ]
+
+                    tile_output = decoder_fn(
+                        tile_latents,
+                        causal=causal,
+                        timestep=timestep,
+                        debug=False,
+                        chunked_conv=chunked_conv,
+                    )
+                    mx.eval(tile_output)
+                    del tile_latents
+
+                    _, _, decoded_t, decoded_h, decoded_w = tile_output.shape
+                    expected_t = out_t_slice.stop - out_t_slice.start
+                    expected_h = out_h_slice.stop - out_h_slice.start
+                    expected_w = out_w_slice.stop - out_w_slice.start
+
+                    actual_t = min(decoded_t, expected_t)
+                    actual_h = min(decoded_h, expected_h)
+                    actual_w = min(decoded_w, expected_w)
+
+                    t_mask_slice = t_mask[:actual_t] if len(t_mask) > actual_t else t_mask
+                    h_mask_slice = h_mask[:actual_h] if len(h_mask) > actual_h else h_mask
+                    w_mask_slice = w_mask[:actual_w] if len(w_mask) > actual_w else w_mask
+
+                    blend_mask = (
+                        t_mask_slice.reshape(1, 1, -1, 1, 1)
+                        * h_mask_slice.reshape(1, 1, 1, -1, 1)
+                        * w_mask_slice.reshape(1, 1, 1, 1, -1)
+                    )
+
+                    tile_output_slice = tile_output[
+                        :, :, :actual_t, :actual_h, :actual_w
+                    ].astype(mx.float32)
+                    del tile_output
+
+                    local_t_start = out_t_slice.start - active_start
+                    local_t_end = local_t_start + actual_t
+                    local_h_start = out_h_slice.start
+                    local_h_end = local_h_start + actual_h
+                    local_w_start = out_w_slice.start
+                    local_w_end = local_w_start + actual_w
+
+                    weighted_tile = tile_output_slice * blend_mask
+                    active_output[
+                        :,
+                        :,
+                        local_t_start:local_t_end,
+                        local_h_start:local_h_end,
+                        local_w_start:local_w_end,
+                    ] = (
+                        active_output[
+                            :,
+                            :,
+                            local_t_start:local_t_end,
+                            local_h_start:local_h_end,
+                            local_w_start:local_w_end,
+                        ]
+                        + weighted_tile
+                    )
+                    active_weights[
+                        :,
+                        :,
+                        local_t_start:local_t_end,
+                        local_h_start:local_h_end,
+                        local_w_start:local_w_end,
+                    ] = (
+                        active_weights[
+                            :,
+                            :,
+                            local_t_start:local_t_end,
+                            local_h_start:local_h_end,
+                            local_w_start:local_w_end,
+                        ]
+                        + blend_mask
+                    )
+
+                    mx.eval(active_output, active_weights)
+
+                    del tile_output_slice, weighted_tile, blend_mask
+                    del t_mask_slice, h_mask_slice, w_mask_slice
+
+                    tile_idx += 1
+
+                    if tile_idx % 4 == 0:
+                        gc.collect()
+                        try:
+                            mx.clear_cache()
+                        except Exception:
+                            pass
+
+            if on_frames_ready is not None and t_idx < num_t_tiles - 1:
+                next_tile_start_latent = temporal_intervals.starts[t_idx + 1]
+                next_tile_start_out = (
+                    0
+                    if next_tile_start_latent == 0
+                    else 1 + (next_tile_start_latent - 1) * temporal_scale
+                )
+
+                emit_ready_frames(next_tile_start_out)
+                gc.collect()
+
+        if active_output is not None:
+            emit_ready_frames(active_start + active_output.shape[2])
+            gc.collect()
+
+        return None
+
     # Initialize output and weight accumulator
     # Use float32 for accumulation to avoid precision issues
     output = mx.zeros((b, 3, out_f, out_h, out_w), dtype=mx.float32)
