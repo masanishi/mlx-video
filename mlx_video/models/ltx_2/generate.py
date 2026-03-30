@@ -639,7 +639,12 @@ def invalidate_distilled_transformer_compile_cache(
     if transformer is None:
         return
 
-    for attr in ("_compiled_distilled_video", "_compiled_distilled_av"):
+    for attr in (
+        "_compiled_distilled_video",
+        "_compiled_distilled_av",
+        "_compiled_distilled_stage2_video",
+        "_compiled_distilled_stage2_av",
+    ):
         if hasattr(transformer, attr):
             delattr(transformer, attr)
 
@@ -735,9 +740,17 @@ def get_distilled_transformer_forward(
     transformer: LTXModel,
     *,
     enable_audio: bool,
+    compile_outer_transformer: bool = False,
 ):
     """Return a cached distilled forward specialized for video-only or A/V."""
-    attr = "_compiled_distilled_av" if enable_audio else "_compiled_distilled_video"
+    if compile_outer_transformer:
+        attr = (
+            "_compiled_distilled_stage2_av"
+            if enable_audio
+            else "_compiled_distilled_stage2_video"
+        )
+    else:
+        attr = "_compiled_distilled_av" if enable_audio else "_compiled_distilled_video"
     compiled = getattr(transformer, attr, None)
     if compiled is not None:
         return compiled
@@ -799,6 +812,9 @@ def get_distilled_transformer_forward(
             )
             return transformer(video=video_modality, audio=None)
 
+    if compile_outer_transformer:
+        forward = mx.compile(forward)
+
     setattr(transformer, attr, forward)
     return forward
 
@@ -815,6 +831,7 @@ def denoise_distilled(
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
     audio_frozen: bool = False,
+    compile_outer_transformer: bool = False,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -852,6 +869,7 @@ def denoise_distilled(
     compiled_forward = get_distilled_transformer_forward(
         transformer,
         enable_audio=enable_audio,
+        compile_outer_transformer=compile_outer_transformer,
     )
 
     with Progress(
@@ -3466,6 +3484,7 @@ def generate_video(
                 audio_positions=None if stage2_video_only else audio_positions,
                 audio_embeddings=None if stage2_video_only else audio_embeddings,
                 audio_frozen=is_a2v,
+                compile_outer_transformer=True,
             )
             if refined_audio_latents is not None:
                 audio_latents = refined_audio_latents
@@ -3941,6 +3960,7 @@ def generate_video(
                 audio_positions=None if low_memory_stage2_video_only else audio_positions,
                 audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings_pos,
                 audio_frozen=is_a2v,
+                compile_outer_transformer=True,
             )
             if refined_audio_latents is not None:
                 audio_latents = refined_audio_latents
