@@ -65,6 +65,10 @@ uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic
     --transformer-quantization-mode mxfp8 \
     --transformer-quantize-inputs
 
+# Distilled + experimental Stage 1 outer compile
+uv run --no-sync mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --compile-stage1-transformer
+
 # Image-to-Video (aspect ratio preserved via letterbox)
 uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg
 
@@ -86,6 +90,8 @@ uv run mlx_video.ltx_2.generate --pipeline dev-two-stage-hq \
 By default, `uv run mlx_video.ltx_2.generate` now uses `prince-canuma/LTX-2.3-distilled`. If that repo does not include an embedded text encoder, the CLI automatically resolves `google/gemma-3-12b-it` unless you pass `--text-encoder-repo` explicitly.
 
 For `distilled`, the quality-preserving default remains the fixed `8 + 3` schedule. Adding `--transformer-quantization-bits 8 --transformer-quantization-mode affine` only changes transformer weight storage/compute; it does **not** reduce the default 3-step Stage 2 refinement. Experimental `mxfp8` support is also available, and `--transformer-quantize-inputs` extends it from weight-only quantization to activation quantization for the targeted transformer linears. Speedups remain hardware- and workload-dependent. For audio-heavy low-memory runs, `--preserve-stage2-audio-refinement` keeps the second-pass audio update on at the cost of higher peak memory.
+
+`--compile-stage1-transformer` is an additional experimental distilled-only speed option. It MLX-compiles the Stage 1 transformer wrapper, which can reduce wall time on long runs, but it raises the initial trace memory peak.
 
 If you want `--transformer-quantize-inputs` to stay enabled, install the patched MLX build with `./scripts/install_mlx_mxfp8_qqmm.sh` and run generation with `uv run --no-sync ...`. Plain `uv run ...` will restore the stock `mlx==0.31.1` from `uv.lock` and activation quantization will fall back to weight-only mode.
 
@@ -149,6 +155,7 @@ Pre-converted weights are available on HuggingFace ([LTX-2-distilled](https://hu
 | `--transformer-quantization-mode` | `affine` | Runtime quantization mode: `affine` or experimental `mxfp8` |
 | `--transformer-quantization-group-size` | mode-dependent | Group size used by runtime transformer quantization. Defaults to `64` for `affine`, `32` for `mxfp8` |
 | `--transformer-quantize-inputs` | false | Experimental: quantize transformer activations on the fly. Currently supported with `mxfp8` only |
+| `--compile-stage1-transformer` | false | Experimental: MLX-compile the distilled Stage 1 transformer wrapper. Distilled pipeline only; higher initial trace memory |
 | `--preserve-stage2-audio-refinement` | false | Keep Stage 2 audio refinement on even in `--low-memory` mode (higher peak memory, better audio) |
 | `--audio-bitrate` | `320k` | AAC bitrate used when muxing MP4 audio |
 | `--lora-path` | None | Path to a LoRA safetensors file for `distilled` / `dev-two-stage` / `dev-two-stage-hq`; auto-detected from the model repo for the two-stage pipelines when omitted |

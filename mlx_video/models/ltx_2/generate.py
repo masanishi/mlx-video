@@ -642,6 +642,8 @@ def invalidate_distilled_transformer_compile_cache(
     for attr in (
         "_compiled_distilled_video",
         "_compiled_distilled_av",
+        "_compiled_distilled_stage1_video",
+        "_compiled_distilled_stage1_av",
         "_compiled_distilled_stage2_video",
         "_compiled_distilled_stage2_av",
     ):
@@ -741,13 +743,19 @@ def get_distilled_transformer_forward(
     *,
     enable_audio: bool,
     compile_outer_transformer: bool = False,
+    compile_cache_scope: str = "stage1",
 ):
     """Return a cached distilled forward specialized for video-only or A/V."""
     if compile_outer_transformer:
+        if compile_cache_scope not in ("stage1", "stage2"):
+            raise ValueError(
+                f"Unsupported compile cache scope: {compile_cache_scope!r}. "
+                'Expected "stage1" or "stage2".'
+            )
         attr = (
-            "_compiled_distilled_stage2_av"
+            f"_compiled_distilled_{compile_cache_scope}_av"
             if enable_audio
-            else "_compiled_distilled_stage2_video"
+            else f"_compiled_distilled_{compile_cache_scope}_video"
         )
     else:
         attr = "_compiled_distilled_av" if enable_audio else "_compiled_distilled_video"
@@ -832,6 +840,7 @@ def denoise_distilled(
     audio_embeddings: Optional[mx.array] = None,
     audio_frozen: bool = False,
     compile_outer_transformer: bool = False,
+    compile_cache_scope: str = "stage1",
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -870,6 +879,7 @@ def denoise_distilled(
         transformer,
         enable_audio=enable_audio,
         compile_outer_transformer=compile_outer_transformer,
+        compile_cache_scope=compile_cache_scope,
     )
 
     with Progress(
@@ -2570,6 +2580,7 @@ def generate_video(
     transformer_quantization_group_size: Optional[int] = None,
     transformer_quantization_mode: str = "affine",
     transformer_quantize_inputs: bool = False,
+    compile_stage1_transformer: bool = False,
     dev_two_stage_sigma_preset: str = "default",
     return_video: bool = True,
     audio_bitrate: str = "320k",
@@ -2645,6 +2656,9 @@ def generate_video(
             Supports "affine" and experimental "mxfp8".
         transformer_quantize_inputs: Quantize transformer activations on the
             fly in addition to weights. Currently only supported for mxfp8.
+        compile_stage1_transformer: Experimentally `mx.compile()` the distilled
+            Stage 1 transformer wrapper. Can improve speed, but initial trace
+            peak memory is higher.
         dev_two_stage_sigma_preset: Sigma schedule preset for dev-two-stage.
             "default" keeps the existing dynamic dev Stage 1 scheduler and
             legacy Stage 2 sigmas; "official" matches the official 2.3
@@ -2673,6 +2687,10 @@ def generate_video(
         )
     if stg_skip_step < 1:
         raise ValueError(f"stg_skip_step must be >= 1, got {stg_skip_step}")
+    if compile_stage1_transformer and pipeline != PipelineType.DISTILLED:
+        raise ValueError(
+            "Stage 1 transformer compile is currently supported for the distilled pipeline only."
+        )
     if modality_skip_step < 1:
         raise ValueError(
             f"modality_skip_step must be >= 1, got {modality_skip_step}"
@@ -3326,6 +3344,8 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            compile_outer_transformer=compile_stage1_transformer,
+            compile_cache_scope="stage1",
         )
 
         if state1 is not None:
@@ -3485,6 +3505,7 @@ def generate_video(
                 audio_embeddings=None if stage2_video_only else audio_embeddings,
                 audio_frozen=is_a2v,
                 compile_outer_transformer=True,
+                compile_cache_scope="stage2",
             )
             if refined_audio_latents is not None:
                 audio_latents = refined_audio_latents
@@ -3961,6 +3982,7 @@ def generate_video(
                 audio_embeddings=None if low_memory_stage2_video_only else audio_embeddings_pos,
                 audio_frozen=is_a2v,
                 compile_outer_transformer=True,
+                compile_cache_scope="stage2",
             )
             if refined_audio_latents is not None:
                 audio_latents = refined_audio_latents
@@ -4780,6 +4802,11 @@ Examples:
         action="store_true",
         help="Experimental: quantize transformer activations on the fly (mxfp8 only)",
     )
+    parser.add_argument(
+        "--compile-stage1-transformer",
+        action="store_true",
+        help="Experimental: MLX-compile the distilled Stage 1 transformer wrapper (higher initial trace memory)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma"
@@ -5083,6 +5110,7 @@ Examples:
         transformer_quantization_group_size=args.transformer_quantization_group_size,
         transformer_quantization_mode=args.transformer_quantization_mode,
         transformer_quantize_inputs=args.transformer_quantize_inputs,
+        compile_stage1_transformer=args.compile_stage1_transformer,
         dev_two_stage_sigma_preset=args.dev_two_stage_sigma_preset,
         return_video=args.save_frames,
         audio_bitrate=args.audio_bitrate,

@@ -313,6 +313,30 @@ def test_main_accepts_stage2_refinement_steps(monkeypatch):
     assert captured["stage2_refinement_steps"] == 1
 
 
+def test_main_accepts_compile_stage1_transformer(monkeypatch):
+    captured = {}
+
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(generate_module, "generate_video", fake_generate_video)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mlx_video.ltx_2.generate",
+            "--prompt",
+            "demo prompt",
+            "--compile-stage1-transformer",
+        ],
+    )
+
+    generate_module.main()
+
+    assert captured["compile_stage1_transformer"] is True
+
+
 def test_main_accepts_disable_stage2_audio_refinement(monkeypatch):
     captured = {}
 
@@ -362,6 +386,24 @@ def test_main_accepts_preserve_stage2_audio_refinement(monkeypatch):
     generate_module.main()
 
     assert captured["preserve_stage2_audio_refinement"] is True
+
+
+def test_generate_video_rejects_stage1_compile_for_non_distilled():
+    with pytest.raises(
+        ValueError,
+        match="Stage 1 transformer compile is currently supported for the distilled pipeline only.",
+    ):
+        generate_module.generate_video(
+            model_repo="dummy/repo",
+            text_encoder_repo=None,
+            prompt="demo prompt",
+            pipeline=generate_module.PipelineType.DEV,
+            height=32,
+            width=32,
+            num_frames=9,
+            compile_stage1_transformer=True,
+            verbose=False,
+        )
 
 
 def test_main_accepts_audio_bitrate(monkeypatch):

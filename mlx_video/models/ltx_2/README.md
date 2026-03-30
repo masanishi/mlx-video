@@ -31,6 +31,10 @@ uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic
     --transformer-quantization-mode mxfp8 \
     --transformer-quantize-inputs
 
+# Distilled + experimental Stage 1 outer compile
+uv run --no-sync mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768 \
+    --compile-stage1-transformer
+
 # Dev - single-stage with CFG
 uv run mlx_video.ltx_2.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
 
@@ -183,6 +187,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--transformer-quantization-mode` | `affine` | Runtime quantization mode: `affine` or experimental `mxfp8` |
 | `--transformer-quantization-group-size` | mode-dependent | Group size used by runtime transformer quantization. Defaults to `64` for `affine`, `32` for `mxfp8` |
 | `--transformer-quantize-inputs` | false | Experimental: quantize transformer activations on the fly. Currently supported with `mxfp8` only |
+| `--compile-stage1-transformer` | false | Experimental: MLX-compile the distilled Stage 1 transformer wrapper. Distilled pipeline only; higher initial trace memory |
 | `--preserve-stage2-audio-refinement` | false | Keep Stage 2 audio refinement on even in `--low-memory` mode (higher peak memory, better audio) |
 | `--audio-bitrate` | `320k` | AAC bitrate used when muxing MP4 audio |
 
@@ -215,6 +220,8 @@ uv run mlx_video.ltx_2.generate --prompt "A sunset" --model-repo ./LTX-2.3-disti
 > **Distilled quality note:** The default distilled pipeline keeps its fixed 8-step Stage 1 and 3-step Stage 2 refinement schedule. `--transformer-quantization-bits 8` only changes the transformer precision/storage path; it does **not** reduce the upsampler or the default 3-step Stage 2 refinement.
 
 > **Experimental `mxfp8` note:** `--transformer-quantization-mode mxfp8` supports weight-only quantization by default, and `--transformer-quantize-inputs` adds activation quantization for the targeted transformer linears. Both modes remain hardware/workload dependent and are not guaranteed to beat `affine` 8-bit on every Apple Silicon setup.
+
+> **Experimental Stage 1 compile note:** `--compile-stage1-transformer` is distilled-only. It MLX-compiles the Stage 1 transformer wrapper, which can lower wall time on long runs, but the first trace uses more memory.
 
 ### Dev / Dev-Two-Stage
 

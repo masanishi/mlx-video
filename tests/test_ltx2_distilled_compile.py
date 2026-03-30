@@ -132,6 +132,79 @@ def test_denoise_distilled_compiles_stage2_outer_function_once_per_mode(monkeypa
         [1.0, 0.0],
         verbose=False,
         compile_outer_transformer=True,
+        compile_cache_scope="stage2",
+    )
+    generate_module.denoise_distilled(
+        latents,
+        positions,
+        text_embeddings,
+        transformer,
+        [1.0, 0.0],
+        verbose=False,
+        compile_outer_transformer=True,
+        compile_cache_scope="stage2",
+    )
+
+    assert hasattr(transformer, "_compiled_distilled_stage2_video")
+    assert len(compiled) == 1
+
+    audio_latents = mx.zeros((1, 2, 1, 2), dtype=mx.float32)
+    audio_positions = mx.zeros((1, 1, 1, 2), dtype=mx.float32)
+    audio_embeddings = mx.zeros((1, 1, 4), dtype=mx.float32)
+
+    generate_module.denoise_distilled(
+        latents,
+        positions,
+        text_embeddings,
+        transformer,
+        [1.0, 0.0],
+        verbose=False,
+        audio_latents=audio_latents,
+        audio_positions=audio_positions,
+        audio_embeddings=audio_embeddings,
+        compile_outer_transformer=True,
+        compile_cache_scope="stage2",
+    )
+    generate_module.denoise_distilled(
+        latents,
+        positions,
+        text_embeddings,
+        transformer,
+        [1.0, 0.0],
+        verbose=False,
+        audio_latents=audio_latents,
+        audio_positions=audio_positions,
+        audio_embeddings=audio_embeddings,
+        compile_outer_transformer=True,
+        compile_cache_scope="stage2",
+    )
+
+    assert hasattr(transformer, "_compiled_distilled_stage2_av")
+    assert len(compiled) == 2
+
+
+def test_denoise_distilled_compiles_stage1_outer_function_once_per_mode(monkeypatch):
+    compiled = []
+
+    def fake_compile(fn):
+        compiled.append(fn)
+        return fn
+
+    monkeypatch.setattr(generate_module.mx, "compile", fake_compile)
+
+    transformer = _FakeDistilledTransformer()
+    latents = mx.zeros((1, 2, 1, 1, 1), dtype=mx.float32)
+    positions = mx.zeros((1, 3, 1, 2), dtype=mx.float32)
+    text_embeddings = mx.zeros((1, 1, 4), dtype=mx.float32)
+
+    generate_module.denoise_distilled(
+        latents,
+        positions,
+        text_embeddings,
+        transformer,
+        [1.0, 0.0],
+        verbose=False,
+        compile_outer_transformer=True,
     )
     generate_module.denoise_distilled(
         latents,
@@ -143,7 +216,7 @@ def test_denoise_distilled_compiles_stage2_outer_function_once_per_mode(monkeypa
         compile_outer_transformer=True,
     )
 
-    assert hasattr(transformer, "_compiled_distilled_stage2_video")
+    assert hasattr(transformer, "_compiled_distilled_stage1_video")
     assert len(compiled) == 1
 
     audio_latents = mx.zeros((1, 2, 1, 2), dtype=mx.float32)
@@ -175,7 +248,7 @@ def test_denoise_distilled_compiles_stage2_outer_function_once_per_mode(monkeypa
         compile_outer_transformer=True,
     )
 
-    assert hasattr(transformer, "_compiled_distilled_stage2_av")
+    assert hasattr(transformer, "_compiled_distilled_stage1_av")
     assert len(compiled) == 2
 
 
